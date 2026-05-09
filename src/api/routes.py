@@ -651,6 +651,24 @@ async def _build_image_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _build_image_reference_parts(uri: str) -> List[Dict[str, Any]]:
+    """Build lightweight Gemini image parts that preserve the original URL."""
+    if uri.startswith("data:image"):
+        mime_type, _ = _decode_data_url(uri)
+        match = DATA_URL_RE.match(uri)
+        if match:
+            return [{"inlineData": {"mimeType": mime_type, "data": match.group("data")}}]
+
+    return [
+        {
+            "fileData": {
+                "mimeType": _guess_mime_type(uri, "image/png"),
+                "fileUri": uri,
+            }
+        }
+    ]
+
+
 def _build_video_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
     return [
         {
@@ -701,7 +719,7 @@ async def _build_gemini_success_payload(
                 item_index = idx
 
             if image_url:
-                parts = await _build_image_parts_from_uri(image_url)
+                parts = _build_image_reference_parts(image_url)
             else:
                 prompt_text = str(item.get("prompt") or "").strip()
                 error_text = str(item.get("error") or "Generation failed").strip()

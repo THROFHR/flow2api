@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from src.api import routes
 from src.core.models import GeminiContent, GeminiGenerateContentRequest, GeminiPart
@@ -41,9 +41,6 @@ class GeminiBatchRequestNormalizationTests(unittest.IsolatedAsyncioTestCase):
 
 class GeminiBatchResponsePayloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_gemini_success_payload_emits_multiple_candidates(self):
-        async def fake_build_image_parts(uri: str):
-            return [{"fileData": {"fileUri": uri, "mimeType": "image/png"}}]
-
         payload = {
             "images": [
                 {"url": "https://example.com/1.png"},
@@ -51,8 +48,10 @@ class GeminiBatchResponsePayloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        with patch.object(routes, "_build_image_parts_from_uri", AsyncMock(side_effect=fake_build_image_parts)):
-            result = await routes._build_gemini_success_payload(payload, "gemini-3.1-flash-image-landscape")
+        result = await routes._build_gemini_success_payload(
+            payload,
+            "gemini-3.1-flash-image-landscape",
+        )
 
         self.assertEqual(result["modelVersion"], "gemini-3.1-flash-image-landscape")
         self.assertEqual(len(result["candidates"]), 2)
@@ -66,9 +65,6 @@ class GeminiBatchResponsePayloadTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_build_gemini_success_payload_keeps_failed_batch_items(self):
-        async def fake_build_image_parts(uri: str):
-            return [{"fileData": {"fileUri": uri, "mimeType": "image/png"}}]
-
         payload = {
             "images": [
                 {"index": 0, "prompt": "赛博朋克海报风格", "status": "succeeded", "url": "https://example.com/1.png"},
@@ -76,8 +72,10 @@ class GeminiBatchResponsePayloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        with patch.object(routes, "_build_image_parts_from_uri", AsyncMock(side_effect=fake_build_image_parts)):
-            result = await routes._build_gemini_success_payload(payload, "gemini-3.1-flash-image-landscape")
+        result = await routes._build_gemini_success_payload(
+            payload,
+            "gemini-3.1-flash-image-landscape",
+        )
 
         self.assertEqual(len(result["candidates"]), 2)
         self.assertEqual(
@@ -87,6 +85,25 @@ class GeminiBatchResponsePayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result["candidates"][1]["content"]["parts"][0]["text"],
             "[batch 2] 黑白纪实摄影风格\nGeneration failed: timeout",
+        )
+
+    async def test_build_gemini_success_payload_keeps_data_urls_inline(self):
+        payload = {
+            "images": [
+                {
+                    "url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/6xjISlAA",
+                }
+            ]
+        }
+
+        result = await routes._build_gemini_success_payload(
+            payload,
+            "gemini-3.1-flash-image-landscape",
+        )
+
+        self.assertEqual(
+            result["candidates"][0]["content"]["parts"][0]["inlineData"]["mimeType"],
+            "image/jpeg",
         )
 
 
