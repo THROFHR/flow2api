@@ -1762,22 +1762,51 @@ class GenerationHandler:
                     for idx, prompt_text in enumerate(prompts)
                 ]
             else:
+                async def _run_batch_item(prompt_index: int, prompt_text: str):
+                    try:
+                        return await self._process_single_batch_image_item(
+                            token=token,
+                            project_id=project_id,
+                            model_config=model_config,
+                            prompt=prompt_text,
+                            prompt_index=prompt_index,
+                            total_prompts=len(prompts),
+                            image_inputs=image_inputs,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            normalized_tier=normalized_tier,
+                        )
+                    except Exception as exc:
+                        error_message = self._normalize_error_message(exc, max_length=240)
+                        debug_logger.log_error(
+                            f"[BATCH IMAGE] 并发子任务异常 ({prompt_index + 1}/{len(prompts)}): {error_message}"
+                        )
+                        return (
+                            self._build_failed_batch_item(prompt_index, prompt_text, error_message),
+                            {
+                                "type": "image",
+                                "prompt": prompt_text,
+                                "status": "failed",
+                                "error": error_message,
+                            },
+                            {
+                                "index": prompt_index,
+                                "prompt": prompt_text,
+                                "status": "failed",
+                                "error": error_message,
+                            },
+                        )
+
+                tasks = [
+                    asyncio.create_task(_run_batch_item(idx, prompt_text))
+                    for idx, prompt_text in enumerate(prompts)
+                ]
+                task_results = await asyncio.gather(*tasks)
+
                 total_generate_ms = 0
                 total_upsample_ms = 0
                 total_cache_ms = 0
-                for idx, prompt_text in enumerate(prompts):
-                    item_result, generated_asset, item_trace = await self._process_single_batch_image_item(
-                        token=token,
-                        project_id=project_id,
-                        model_config=model_config,
-                        prompt=prompt_text,
-                        prompt_index=idx,
-                        total_prompts=len(prompts),
-                        image_inputs=image_inputs,
-                        response_state=response_state,
-                        request_log_state=request_log_state,
-                        normalized_tier=normalized_tier,
-                    )
+                for item_result, generated_asset, item_trace in task_results:
                     batch_items.append(item_result)
                     batch_assets.append(generated_asset)
                     item_traces.append(item_trace)
@@ -2863,7 +2892,8 @@ class GenerationHandler:
         if not log_id:
             return
 
-        safe_progress = max(0, min(100, int(progress)))
+        incoming_progress = max(0, min(100, int(progress)))
+        safe_progress = max(int(request_log_state.get("progress") or 0), incoming_progress)
         now = time.time()
         last_status_text = str(request_log_state.get("last_status_text") or "").strip()
         last_progress = int(request_log_state.get("last_progress") or 0)
