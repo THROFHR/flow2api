@@ -65,6 +65,30 @@ class GeminiBatchResponsePayloadTests(unittest.IsolatedAsyncioTestCase):
             "https://example.com/2.png",
         )
 
+    async def test_build_gemini_success_payload_keeps_failed_batch_items(self):
+        async def fake_build_image_parts(uri: str):
+            return [{"fileData": {"fileUri": uri, "mimeType": "image/png"}}]
+
+        payload = {
+            "images": [
+                {"index": 0, "prompt": "赛博朋克海报风格", "status": "succeeded", "url": "https://example.com/1.png"},
+                {"index": 1, "prompt": "黑白纪实摄影风格", "status": "failed", "error": "timeout"},
+            ]
+        }
+
+        with patch.object(routes, "_build_image_parts_from_uri", AsyncMock(side_effect=fake_build_image_parts)):
+            result = await routes._build_gemini_success_payload(payload, "gemini-3.1-flash-image-landscape")
+
+        self.assertEqual(len(result["candidates"]), 2)
+        self.assertEqual(
+            result["candidates"][0]["content"]["parts"][0]["fileData"]["fileUri"],
+            "https://example.com/1.png",
+        )
+        self.assertEqual(
+            result["candidates"][1]["content"]["parts"][0]["text"],
+            "[batch 2] 黑白纪实摄影风格\nGeneration failed: timeout",
+        )
+
 
 class FlowClientBatchImageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

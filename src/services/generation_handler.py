@@ -4,7 +4,7 @@ import base64
 import json
 import time
 from pathlib import Path
-from typing import Optional, AsyncGenerator, List, Dict, Any
+from typing import Optional, AsyncGenerator, List, Dict, Any, Tuple
 from ..core.logger import debug_logger
 from ..core.config import config
 from ..core.monitoring import record_generation_result
@@ -938,7 +938,13 @@ class GenerationHandler:
 
     def _create_generation_result(self) -> Dict[str, Any]:
         """????????????????"""
-        return dict(success=False, error_message=None, error_emitted=False)
+        return dict(
+            success=False,
+            error_message=None,
+            error_emitted=False,
+            usage_success=False,
+            result_status="failed",
+        )
 
     def _create_response_state(self) -> Dict[str, Any]:
         """为单次请求创建独立的响应状态，避免并发请求互相污染。"""
@@ -954,13 +960,24 @@ class GenerationHandler:
             generation_result["success"] = False
             generation_result["error_message"] = error_message
             generation_result["error_emitted"] = True
+            generation_result["usage_success"] = False
+            generation_result["result_status"] = "failed"
 
-    def _mark_generation_succeeded(self, generation_result: Optional[Dict[str, Any]]):
+    def _mark_generation_succeeded(
+        self,
+        generation_result: Optional[Dict[str, Any]],
+        *,
+        usage_success: bool = True,
+        result_status: str = "success",
+        message: Optional[str] = None,
+    ):
         """???????"""
         if isinstance(generation_result, dict):
             generation_result["success"] = True
-            generation_result["error_message"] = None
+            generation_result["error_message"] = message
             generation_result["error_emitted"] = False
+            generation_result["usage_success"] = usage_success
+            generation_result["result_status"] = result_status
 
     def _normalize_error_message(self, error_message: Any, max_length: int = 1000) -> str:
         """归一化错误文本，避免写入超长内容。"""
@@ -968,6 +985,221 @@ class GenerationHandler:
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
+
+    def _build_failed_batch_item(self, index: int, prompt: str, error_message: Any) -> Dict[str, Any]:
+        """构建批量图片失败项。"""
+        return {
+            "index": index,
+            "prompt": prompt,
+            "status": "failed",
+            "error": self._normalize_error_message(error_message, max_length=240),
+        }
+
+    def _build_batch_summary(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """汇总批量图片结果。"""
+        total = len(items)
+        succeeded = sum(1 for item in items if item.get("status") == "succeeded" and item.get("url"))
+        failed = max(0, total - succeeded)
+        return {
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "partial_success": bool(succeeded and failed),
+            "all_failed": bool(total and not succeeded),
+        }
+
+    def _get_first_successful_batch_url(self, items: List[Dict[str, Any]]) -> Optional[str]:
+        """返回批量结果中的第一张成功图片链接。"""
+        for item in items:
+            url = str(item.get("url") or "").strip()
+            if item.get("status") == "succeeded" and url:
+                return url
+        return None
+
+    async def _process_single_batch_image_item(
+        self,
+        *,
+        token,
+        project_id: str,
+        model_config: Dict[str, Any],
+        prompt: str,
+        prompt_index: int,
+        total_prompts: int,
+        image_inputs: Optional[List[Dict[str, Any]]],
+        response_state: Dict[str, Any],
+        request_log_state: Optional[Dict[str, Any]],
+        normalized_tier: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """逐项执行批量图片请求，返回成功或失败结果。"""
+        item_trace: Dict[str, Any] = {
+            "index": prompt_index,
+            "prompt": prompt,
+            "status": "failed",
+        }
+        generated_asset: Dict[str, Any] = {
+            "type": "image",
+            "prompt": prompt,
+            "status": "failed",
+        }
+
+        progress_start = 28 + int((62 * prompt_index) / max(1, total_prompts))
+        progress_end = 28 + int((62 * (prompt_index + 1)) / max(1, total_prompts))
+        progress_end = max(progress_start + 1, min(progress_end, 96))
+
+        async def _item_progress_callback(status_text: str, progress: int):
+            bounded_progress = max(0, min(100, int(progress)))
+            mapped_progress = progress_start + int((progress_end - progress_start) * bounded_progress / 100)
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text=f"batch_item_{prompt_index + 1}_{status_text}",
+                progress=min(96, mapped_progress),
+            )
+
+        await self._update_request_log_progress(
+            request_log_state,
+            token_id=token.id,
+            status_text=f"batch_item_{prompt_index + 1}_starting",
+            progress=progress_start,
+        )
+
+        try:
+            generate_started_at = time.time()
+            result, generation_session_id, upstream_trace = await self.flow_client.generate_image(
+                at=token.at,
+                project_id=project_id,
+                prompt=prompt,
+                model_name=model_config["model_name"],
+                aspect_ratio=model_config["aspect_ratio"],
+                image_inputs=image_inputs,
+                token_id=token.id,
+                token_image_concurrency=token.image_concurrency,
+                progress_callback=_item_progress_callback,
+            )
+            item_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
+            item_trace["upstream_trace"] = upstream_trace
+        except Exception as exc:
+            error_message = self._normalize_error_message(exc, max_length=240)
+            item_trace["error"] = error_message
+            generated_asset["error"] = error_message
+            return self._build_failed_batch_item(prompt_index, prompt, error_message), generated_asset, item_trace
+
+        media_entries = result.get("media", [])
+        if isinstance(media_entries, dict):
+            media_entries = [media_entries]
+        if not isinstance(media_entries, list) or not media_entries:
+            error_message = "生成结果为空"
+            item_trace["error"] = error_message
+            generated_asset["error"] = error_message
+            return self._build_failed_batch_item(prompt_index, prompt, error_message), generated_asset, item_trace
+
+        try:
+            image_url, media_id = self._extract_generated_image_media(media_entries[0])
+        except Exception as exc:
+            error_message = self._normalize_error_message(exc, max_length=240)
+            item_trace["error"] = error_message
+            generated_asset["error"] = error_message
+            return self._build_failed_batch_item(prompt_index, prompt, error_message), generated_asset, item_trace
+
+        final_url = image_url
+        generated_asset.update({
+            "status": "succeeded",
+            "origin_image_url": image_url,
+        })
+        item_trace["origin_image_url"] = image_url
+        item_trace["media_id"] = media_id
+
+        upsample_resolution = model_config.get("upsample")
+        if upsample_resolution and media_id:
+            resolution_name = "4K" if "4K" in upsample_resolution else "2K"
+            upsample_started_at = time.time()
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text=f"batch_item_{prompt_index + 1}_upsampling_{resolution_name.lower()}",
+                progress=min(98, progress_end + 4),
+            )
+            for retry_attempt in range(config.flow_max_retries):
+                try:
+                    encoded_image = await self.flow_client.upsample_image(
+                        at=token.at,
+                        project_id=project_id,
+                        media_id=media_id,
+                        target_resolution=upsample_resolution,
+                        user_paygate_tier=normalized_tier,
+                        session_id=generation_session_id,
+                        token_id=token.id,
+                    )
+
+                    if not encoded_image:
+                        break
+
+                    generated_asset["upscaled_image"] = {"resolution": resolution_name}
+                    try:
+                        await self._update_request_log_progress(
+                            request_log_state,
+                            token_id=token.id,
+                            status_text="caching_batch_images",
+                            progress=99,
+                        )
+                        cached_filename = await self.file_cache.cache_base64_image(
+                            encoded_image,
+                            resolution_name,
+                        )
+                        final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                        generated_asset["upscaled_image"]["local_url"] = final_url
+                        generated_asset["upscaled_image"]["url"] = final_url
+                    except Exception as exc:
+                        debug_logger.log_error(
+                            f"[BATCH IMAGE] Failed to cache {resolution_name} image {prompt_index + 1}: {str(exc)}"
+                        )
+                        final_url = f"data:image/jpeg;base64,{encoded_image}"
+                        generated_asset["upscaled_image"]["local_url"] = None
+                        generated_asset["upscaled_image"]["url"] = image_url
+                        generated_asset["upscaled_image"]["delivery_mode"] = "inline_base64_fallback"
+                    break
+                except Exception as exc:
+                    error_str = str(exc)
+                    debug_logger.log_error(
+                        f"[BATCH IMAGE] 放大失败 ({prompt_index + 1}/{total_prompts}, "
+                        f"尝试 {retry_attempt + 1}/{config.flow_max_retries}): {error_str}"
+                    )
+                    retry_reason = self.flow_client._get_retry_reason(error_str)
+                    if retry_reason and retry_attempt < config.flow_max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    break
+            item_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
+        else:
+            cache_started_at = time.time()
+            if config.cache_enabled:
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text="caching_batch_images",
+                    progress=99,
+                )
+                try:
+                    cached_filename = await self.file_cache.download_and_cache(image_url, "image")
+                    final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                except Exception as exc:
+                    debug_logger.log_error(
+                        f"[BATCH IMAGE] Failed to cache image {prompt_index + 1}: {str(exc)}"
+                    )
+                    final_url = image_url
+            item_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
+
+        generated_asset["final_image_url"] = final_url
+        item_trace["status"] = "succeeded"
+        item_trace["final_image_url"] = final_url
+        return {
+            "index": prompt_index,
+            "prompt": prompt,
+            "status": "succeeded",
+            "url": final_url,
+            "origin_image_url": image_url,
+            "media_id": media_id,
+        }, generated_asset, item_trace
 
     def _resolve_video_model_key_for_tier(self, model_config: Dict[str, Any], user_tier: str) -> tuple[str, Optional[str]]:
         """根据账号层级调整视频模型 key。"""
@@ -1302,24 +1534,30 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=500)
                 return
 
-            is_video = (generation_type == "video")
-            await self.token_manager.record_usage(token.id, is_video=is_video)
+            result_status = str(generation_result.get("result_status") or "success")
+            usage_success = bool(generation_result.get("usage_success", True))
 
-            # 重置错误计数 (请求成功时清空连续错误计数)
-            await self.token_manager.record_success(token.id)
+            if usage_success:
+                is_video = (generation_type == "video")
+                await self.token_manager.record_usage(token.id, is_video=is_video)
 
-            debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
+                # 重置错误计数 (请求成功时清空连续错误计数)
+                await self.token_manager.record_success(token.id)
+            else:
+                await self.token_manager.record_error(token.id)
+
+            debug_logger.log_info(f"[GENERATION] ✅ 生成响应完成 (status={result_status})")
 
             # 7. 记录成功日志
             duration = time.time() - start_time
-            record_generation_result(generation_type, "success", duration)
-            perf_trace["status"] = "success"
+            record_generation_result(generation_type, "success" if usage_success else "failed", duration)
+            perf_trace["status"] = result_status
             perf_trace["total_ms"] = int(duration * 1000)
             # 日志中保留更完整的 prompt，避免管理页只看到过短内容
 
             # 构建响应数据，包含生成的URL
             response_data = {
-                "status": "success",
+                "status": result_status,
                 "model": model,
                 "prompt": prompt_for_log,
                 "performance": perf_trace
@@ -1478,181 +1716,119 @@ class GenerationHandler:
         try:
             upload_started_at = time.time()
             image_inputs = []
+            upload_error: Optional[str] = None
             if images and len(images) > 0:
-                for image_bytes in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        image_bytes,
-                        model_config["aspect_ratio"],
-                        project_id=project_id
-                    )
-                    image_inputs.append({
-                        "name": media_id,
-                        "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
-                    })
+                try:
+                    for image_bytes in images:
+                        media_id = await self.flow_client.upload_image(
+                            token.at,
+                            image_bytes,
+                            model_config["aspect_ratio"],
+                            project_id=project_id
+                        )
+                        image_inputs.append({
+                            "name": media_id,
+                            "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
+                        })
+                except Exception as exc:
+                    upload_error = self._normalize_error_message(exc, max_length=240)
             if image_trace is not None:
                 image_trace["upload_images_ms"] = int((time.time() - upload_started_at) * 1000)
+            batch_items: List[Dict[str, Any]] = []
+            batch_assets: List[Dict[str, Any]] = []
+            item_traces: List[Dict[str, Any]] = []
 
-            async def _image_progress_callback(status_text: str, progress: int):
-                await self._update_request_log_progress(
-                    request_log_state,
-                    token_id=token.id,
-                    status_text=status_text,
-                    progress=progress,
-                )
+            if upload_error:
+                batch_items = [
+                    self._build_failed_batch_item(idx, prompt_text, upload_error)
+                    for idx, prompt_text in enumerate(prompts)
+                ]
+                batch_assets = [
+                    {
+                        "type": "image",
+                        "prompt": prompt_text,
+                        "status": "failed",
+                        "error": upload_error,
+                    }
+                    for prompt_text in prompts
+                ]
+                item_traces = [
+                    {
+                        "index": idx,
+                        "prompt": prompt_text,
+                        "status": "failed",
+                        "error": upload_error,
+                    }
+                    for idx, prompt_text in enumerate(prompts)
+                ]
+            else:
+                total_generate_ms = 0
+                total_upsample_ms = 0
+                total_cache_ms = 0
+                for idx, prompt_text in enumerate(prompts):
+                    item_result, generated_asset, item_trace = await self._process_single_batch_image_item(
+                        token=token,
+                        project_id=project_id,
+                        model_config=model_config,
+                        prompt=prompt_text,
+                        prompt_index=idx,
+                        total_prompts=len(prompts),
+                        image_inputs=image_inputs,
+                        response_state=response_state,
+                        request_log_state=request_log_state,
+                        normalized_tier=normalized_tier,
+                    )
+                    batch_items.append(item_result)
+                    batch_assets.append(generated_asset)
+                    item_traces.append(item_trace)
+                    total_generate_ms += int(item_trace.get("generate_api_ms") or 0)
+                    total_upsample_ms += int(item_trace.get("upsample_ms") or 0)
+                    total_cache_ms += int(item_trace.get("cache_image_ms") or 0)
 
-            generate_started_at = time.time()
-            result, generation_session_id, upstream_trace = await self.flow_client.generate_images_batch(
-                at=token.at,
-                project_id=project_id,
-                prompts=prompts,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs,
-                token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
-                progress_callback=_image_progress_callback,
-            )
-            if image_trace is not None:
-                image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
-                image_trace["upstream_trace"] = upstream_trace
-                attempts = upstream_trace.get("generation_attempts") if isinstance(upstream_trace, dict) else None
-                if isinstance(attempts, list) and attempts:
-                    first_attempt = attempts[0] if isinstance(attempts[0], dict) else {}
-                    image_trace["launch_queue_wait_ms"] = int(first_attempt.get("launch_queue_ms") or 0)
-                    image_trace["launch_stagger_wait_ms"] = int(first_attempt.get("launch_stagger_ms") or 0)
+                if image_trace is not None:
+                    image_trace["generate_api_ms"] = total_generate_ms
+                    if total_upsample_ms:
+                        image_trace["upsample_ms"] = total_upsample_ms
+                    image_trace["cache_image_ms"] = total_cache_ms
+
             await self._update_request_log_progress(
                 request_log_state,
                 token_id=token.id,
                 status_text="batch_images_generated",
-                progress=72,
+                progress=100,
             )
 
-            media_entries = result.get("media", [])
-            if isinstance(media_entries, dict):
-                media_entries = [media_entries]
-            if not isinstance(media_entries, list) or len(media_entries) < len(prompts):
-                self._mark_generation_failed(generation_result, "批量生成结果为空或数量不足")
-                yield self._create_error_response("批量生成结果为空或数量不足", status_code=502)
-                return
-
-            upsample_resolution = model_config.get("upsample")
-            resolution_name = "4K" if upsample_resolution and "4K" in upsample_resolution else "2K"
-            batch_items: List[Dict[str, Any]] = []
-            batch_assets: List[Dict[str, Any]] = []
-            total_upsample_ms = 0
-            total_cache_ms = 0
-
-            for idx, media_entry in enumerate(media_entries[:len(prompts)]):
-                prompt_text = prompts[idx]
-                image_url, media_id = self._extract_generated_image_media(media_entry)
-                final_url = image_url
-                generated_asset: Dict[str, Any] = {
-                    "type": "image",
-                    "origin_image_url": image_url,
-                }
-
-                if upsample_resolution and media_id:
-                    upsample_started_at = time.time()
-                    await self._update_request_log_progress(
-                        request_log_state,
-                        token_id=token.id,
-                        status_text=f"upsampling_{resolution_name.lower()}",
-                        progress=82,
-                    )
-                    for retry_attempt in range(config.flow_max_retries):
-                        try:
-                            encoded_image = await self.flow_client.upsample_image(
-                                at=token.at,
-                                project_id=project_id,
-                                media_id=media_id,
-                                target_resolution=upsample_resolution,
-                                user_paygate_tier=normalized_tier,
-                                session_id=generation_session_id,
-                                token_id=token.id
-                            )
-
-                            if not encoded_image:
-                                break
-
-                            generated_asset["upscaled_image"] = {
-                                "resolution": resolution_name
-                            }
-                            try:
-                                await self._update_request_log_progress(
-                                    request_log_state,
-                                    token_id=token.id,
-                                    status_text="caching_batch_images",
-                                    progress=90,
-                                )
-                                cached_filename = await self.file_cache.cache_base64_image(
-                                    encoded_image,
-                                    resolution_name,
-                                )
-                                final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
-                                generated_asset["upscaled_image"]["local_url"] = final_url
-                                generated_asset["upscaled_image"]["url"] = final_url
-                            except Exception as e:
-                                debug_logger.log_error(
-                                    f"[BATCH IMAGE] Failed to cache {resolution_name} image {idx + 1}: {str(e)}"
-                                )
-                                final_url = f"data:image/jpeg;base64,{encoded_image}"
-                                generated_asset["upscaled_image"]["local_url"] = None
-                                generated_asset["upscaled_image"]["url"] = image_url
-                                generated_asset["upscaled_image"]["delivery_mode"] = "inline_base64_fallback"
-                            break
-                        except Exception as e:
-                            error_str = str(e)
-                            debug_logger.log_error(
-                                f"[BATCH IMAGE] 放大失败 ({idx + 1}/{len(prompts)}, "
-                                f"尝试 {retry_attempt + 1}/{config.flow_max_retries}): {error_str}"
-                            )
-                            retry_reason = self.flow_client._get_retry_reason(error_str)
-                            if retry_reason and retry_attempt < config.flow_max_retries - 1:
-                                await asyncio.sleep(1)
-                                continue
-                            break
-                    total_upsample_ms += int((time.time() - upsample_started_at) * 1000)
-                else:
-                    cache_started_at = time.time()
-                    if config.cache_enabled:
-                        await self._update_request_log_progress(
-                            request_log_state,
-                            token_id=token.id,
-                            status_text="caching_batch_images",
-                            progress=90,
-                        )
-                        try:
-                            cached_filename = await self.file_cache.download_and_cache(image_url, "image")
-                            final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
-                        except Exception as e:
-                            debug_logger.log_error(
-                                f"[BATCH IMAGE] Failed to cache image {idx + 1}: {str(e)}"
-                            )
-                            final_url = image_url
-                    total_cache_ms += int((time.time() - cache_started_at) * 1000)
-
-                generated_asset["final_image_url"] = final_url
-                batch_items.append({
-                    "index": idx,
-                    "prompt": prompt_text,
-                    "url": final_url,
-                    "origin_image_url": image_url,
-                    "media_id": media_id,
-                })
-                batch_assets.append(generated_asset)
-
-            if image_trace is not None:
-                if total_upsample_ms:
-                    image_trace["upsample_ms"] = total_upsample_ms
-                image_trace["cache_image_ms"] = total_cache_ms
-
-            response_state["url"] = batch_items[0]["url"]
+            summary = self._build_batch_summary(batch_items)
+            response_state["url"] = self._get_first_successful_batch_url(batch_items)
             response_state["generated_assets"] = {
                 "type": "image_batch",
                 "items": batch_assets,
+                "summary": summary,
             }
-            self._mark_generation_succeeded(generation_result)
+            if image_trace is not None:
+                image_trace["batch_items"] = item_traces
+                image_trace["batch_summary"] = summary
+
+            if summary["succeeded"] > 0:
+                result_status = "partial_success" if summary["failed"] else "success"
+                summary_message = (
+                    f"{summary['failed']} of {summary['total']} batch item(s) failed"
+                    if summary["failed"]
+                    else None
+                )
+                self._mark_generation_succeeded(
+                    generation_result,
+                    usage_success=True,
+                    result_status=result_status,
+                    message=summary_message,
+                )
+            else:
+                self._mark_generation_succeeded(
+                    generation_result,
+                    usage_success=False,
+                    result_status="all_failed",
+                    message="All batch items failed",
+                )
 
             if stream:
                 yield self._create_stream_chunk("batchPrompts 暂不支持流式输出\n", finish_reason="stop")
@@ -2599,11 +2775,23 @@ class GenerationHandler:
         import json
         import time
 
-        formatted_content = "\n".join(
-            f"![Generated Image]({item['url']})"
-            for item in items
-            if item.get("url")
-        )
+        content_blocks: List[str] = []
+        for idx, item in enumerate(items):
+            prompt = str(item.get("prompt") or "").strip()
+            prefix = f"[{idx + 1}]"
+            if prompt:
+                prefix = f"{prefix} {prompt}"
+
+            if item.get("status") == "succeeded" and item.get("url"):
+                content_blocks.append(f"{prefix}\n![Generated Image]({item['url']})")
+                continue
+
+            error_message = self._normalize_error_message(item.get("error"), max_length=240)
+            content_blocks.append(f"{prefix}\nGeneration failed: {error_message}")
+
+        formatted_content = "\n\n".join(content_blocks)
+        summary = self._build_batch_summary(items)
+        first_url = self._get_first_successful_batch_url(items)
         response = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -2618,9 +2806,10 @@ class GenerationHandler:
                 "finish_reason": "stop"
             }],
             "images": items,
+            "batch_summary": summary,
         }
-        if items and items[0].get("url"):
-            response["url"] = items[0]["url"]
+        if first_url:
+            response["url"] = first_url
 
         return json.dumps(response, ensure_ascii=False)
 

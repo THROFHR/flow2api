@@ -694,16 +694,29 @@ async def _build_gemini_success_payload(
             if not isinstance(item, dict):
                 continue
             image_url = str(item.get("url") or "").strip()
-            if not image_url:
-                continue
+            item_index = item.get("index", idx)
+            if isinstance(item_index, str) and item_index.isdigit():
+                item_index = int(item_index)
+            if not isinstance(item_index, int):
+                item_index = idx
+
+            if image_url:
+                parts = await _build_image_parts_from_uri(image_url)
+            else:
+                prompt_text = str(item.get("prompt") or "").strip()
+                error_text = str(item.get("error") or "Generation failed").strip()
+                if prompt_text:
+                    parts = [{"text": f"[batch {item_index + 1}] {prompt_text}\nGeneration failed: {error_text}"}]
+                else:
+                    parts = [{"text": f"[batch {item_index + 1}] Generation failed: {error_text}"}]
             candidates.append(
                 {
                     "content": {
                         "role": "model",
-                        "parts": await _build_image_parts_from_uri(image_url),
+                        "parts": parts,
                     },
                     "finishReason": "STOP",
-                    "index": idx,
+                    "index": item_index,
                 }
             )
         if candidates:
