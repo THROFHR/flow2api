@@ -1079,18 +1079,13 @@ class FlowClient:
             }
 
             # 新版图片接口使用结构化提示词 + new media 开关
-            request_data = {
-                "clientContext": client_context,
-                "seed": random.randint(1, 999999),
-                "imageModelName": model_name,
-                "imageAspectRatio": aspect_ratio,
-                "structuredPrompt": {
-                    "parts": [{
-                        "text": prompt
-                    }]
-                },
-                "imageInputs": image_inputs or []
-            }
+            request_data = self._build_image_request_data(
+                client_context=client_context,
+                prompt=prompt,
+                model_name=model_name,
+                aspect_ratio=aspect_ratio,
+                image_inputs=image_inputs,
+            )
 
             json_data = {
                 "clientContext": client_context,
@@ -1134,6 +1129,176 @@ class FlowClient:
                 await self._notify_browser_captcha_request_finished(browser_id)
         
         # 所有重试都失败
+        perf_trace["final_success_attempt"] = None
+        raise last_error
+
+    def _build_image_request_data(
+        self,
+        client_context: Dict[str, Any],
+        prompt: str,
+        model_name: str,
+        aspect_ratio: str,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """构建单条图片生成请求体。"""
+        return {
+            "clientContext": client_context,
+            "seed": random.randint(1, 999999),
+            "imageModelName": model_name,
+            "imageAspectRatio": aspect_ratio,
+            "structuredPrompt": {
+                "parts": [{
+                    "text": prompt
+                }]
+            },
+            "imageInputs": image_inputs or []
+        }
+
+    async def generate_images_batch(
+        self,
+        at: str,
+        project_id: str,
+        prompts: List[str],
+        model_name: str,
+        aspect_ratio: str,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        token_id: Optional[int] = None,
+        token_image_concurrency: Optional[int] = None,
+        progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
+    ) -> tuple[dict, str, Dict[str, Any]]:
+        """批量生成图片，共享同一组参考图输入。"""
+        normalized_prompts = [str(prompt or "").strip() for prompt in prompts if str(prompt or "").strip()]
+        if not normalized_prompts:
+            raise ValueError("prompts cannot be empty")
+
+        url = f"{self.api_base_url}/projects/{project_id}/flowMedia:batchGenerateImages"
+
+        max_retries = config.flow_max_retries
+        last_error = None
+        perf_trace: Dict[str, Any] = {
+            "max_retries": max_retries,
+            "batch_size": len(normalized_prompts),
+            "generation_attempts": [],
+        }
+
+        for retry_attempt in range(max_retries):
+            attempt_trace: Dict[str, Any] = {
+                "attempt": retry_attempt + 1,
+                "recaptcha_ok": False,
+            }
+            attempt_started_at = time.time()
+            recaptcha_started_at = time.time()
+            if progress_callback is not None:
+                await progress_callback("solving_image_captcha", 38)
+            launch_gate_acquired = False
+            launch_ok, launch_queue_ms, launch_stagger_ms = await self._acquire_image_launch_gate(
+                token_id=token_id,
+                token_image_concurrency=token_image_concurrency,
+            )
+            attempt_trace["launch_queue_ms"] = launch_queue_ms
+            attempt_trace["launch_stagger_ms"] = launch_stagger_ms
+            if not launch_ok:
+                last_error = Exception("Image launch queue wait timeout")
+                attempt_trace["success"] = False
+                attempt_trace["error"] = str(last_error)
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                perf_trace["generation_attempts"].append(attempt_trace)
+                raise last_error
+
+            launch_gate_acquired = True
+            try:
+                recaptcha_token, browser_id = await self._get_recaptcha_token(
+                    project_id,
+                    action="IMAGE_GENERATION",
+                    token_id=token_id
+                )
+            finally:
+                if launch_gate_acquired:
+                    await self._release_image_launch_gate(token_id)
+            attempt_trace["recaptcha_ms"] = int((time.time() - recaptcha_started_at) * 1000)
+            attempt_trace["recaptcha_ok"] = bool(recaptcha_token)
+            if not recaptcha_token:
+                last_error = Exception("Failed to obtain reCAPTCHA token")
+                attempt_trace["success"] = False
+                attempt_trace["error"] = str(last_error)
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                perf_trace["generation_attempts"].append(attempt_trace)
+                should_retry = await self._handle_missing_recaptcha_token(
+                    retry_attempt=retry_attempt,
+                    max_retries=max_retries,
+                    browser_id=browser_id,
+                    project_id=project_id,
+                    log_prefix="[IMAGE BATCH] 生成",
+                )
+                if should_retry:
+                    continue
+                raise last_error
+            if progress_callback is not None:
+                await progress_callback("submitting_batch_images", 48)
+            session_id = self._generate_session_id()
+
+            client_context = {
+                "recaptchaContext": {
+                    "token": recaptcha_token,
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB"
+                },
+                "sessionId": session_id,
+                "projectId": project_id,
+                "tool": "PINHOLE"
+            }
+
+            request_data = [
+                self._build_image_request_data(
+                    client_context=client_context,
+                    prompt=prompt,
+                    model_name=model_name,
+                    aspect_ratio=aspect_ratio,
+                    image_inputs=image_inputs,
+                )
+                for prompt in normalized_prompts
+            ]
+
+            json_data = {
+                "clientContext": client_context,
+                "mediaGenerationContext": {
+                    "batchId": str(uuid.uuid4())
+                },
+                "useNewMedia": True,
+                "requests": request_data
+            }
+
+            try:
+                result = await self._make_image_generation_request(
+                    url=url,
+                    json_data=json_data,
+                    at=at,
+                    attempt_trace=attempt_trace,
+                )
+                attempt_trace["success"] = True
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                perf_trace["generation_attempts"].append(attempt_trace)
+                perf_trace["final_success_attempt"] = retry_attempt + 1
+                return result, session_id, perf_trace
+            except Exception as e:
+                last_error = e
+                attempt_trace["success"] = False
+                attempt_trace["error"] = str(e)[:240]
+                attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
+                perf_trace["generation_attempts"].append(attempt_trace)
+                should_retry = await self._handle_retryable_generation_error(
+                    error=e,
+                    retry_attempt=retry_attempt,
+                    max_retries=max_retries,
+                    browser_id=browser_id,
+                    project_id=project_id,
+                    log_prefix="[IMAGE BATCH] 生成",
+                )
+                if should_retry:
+                    continue
+                raise
+            finally:
+                await self._notify_browser_captcha_request_finished(browser_id)
+
         perf_trace["final_success_attempt"] = None
         raise last_error
 

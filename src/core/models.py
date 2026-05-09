@@ -278,6 +278,7 @@ class GeminiGenerateContentRequest(BaseModel):
     contents: List[GeminiContent]
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
+    batchPrompts: Optional[List[str]] = None
 
     model_config = ConfigDict(extra="allow")
 

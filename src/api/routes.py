@@ -78,6 +78,7 @@ class NormalizedGenerationRequest:
     model: str
     prompt: str
     images: List[bytes]
+    batch_prompts: Optional[List[str]] = None
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
 
@@ -457,12 +458,35 @@ async def _normalize_gemini_request(
 ) -> NormalizedGenerationRequest:
     resolved_model = _resolve_request_model(model, request)
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
+    batch_prompts: Optional[List[str]] = None
+    if request.batchPrompts is not None:
+        batch_prompts = []
+        for idx, item in enumerate(request.batchPrompts):
+            if not isinstance(item, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"batchPrompts[{idx}] must be a string",
+                )
+            text = item.strip()
+            if text:
+                batch_prompts.append(text)
+        if not batch_prompts:
+            raise HTTPException(status_code=400, detail="batchPrompts cannot be empty")
+
     system_instruction = _extract_text_from_gemini_content(request.systemInstruction)
     model_config = MODEL_CONFIG.get(resolved_model)
     media_model = bool(model_config and model_config.get("type") in {"image", "video"})
 
     if media_model:
         prompt = _sanitize_media_prompt(prompt)
+        if batch_prompts:
+            batch_prompts = [_sanitize_media_prompt(item) for item in batch_prompts]
+
+    if batch_prompts:
+        batch_prompts = [
+            "\n\n".join(part for part in [prompt, item] if part).strip()
+            for item in batch_prompts
+        ]
 
     if system_instruction:
         if media_model and _should_ignore_media_system_instruction(system_instruction):
@@ -473,11 +497,17 @@ async def _normalize_gemini_request(
             if media_model:
                 system_instruction = _sanitize_media_prompt(system_instruction)
             prompt = f"{system_instruction}\n\n{prompt}".strip()
+            if batch_prompts:
+                batch_prompts = [
+                    f"{system_instruction}\n\n{item}".strip() if item else system_instruction
+                    for item in batch_prompts
+                ]
 
     return NormalizedGenerationRequest(
         model=resolved_model,
         prompt=prompt,
         images=images,
+        batch_prompts=batch_prompts,
     )
 
 
@@ -487,6 +517,7 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    batch_prompts: Optional[List[str]] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -497,6 +528,7 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        batch_prompts=batch_prompts,
     ):
         result = chunk
 
@@ -655,6 +687,31 @@ async def _build_gemini_success_payload(
     payload: Dict[str, Any],
     response_model: str,
 ) -> Dict[str, Any]:
+    batch_images = payload.get("images")
+    if isinstance(batch_images, list) and batch_images:
+        candidates: List[Dict[str, Any]] = []
+        for idx, item in enumerate(batch_images):
+            if not isinstance(item, dict):
+                continue
+            image_url = str(item.get("url") or "").strip()
+            if not image_url:
+                continue
+            candidates.append(
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": await _build_image_parts_from_uri(image_url),
+                    },
+                    "finishReason": "STOP",
+                    "index": idx,
+                }
+            )
+        if candidates:
+            return {
+                "candidates": candidates,
+                "modelVersion": response_model,
+            }
+
     output = _extract_openai_message_content(payload)
     return {
         "candidates": [
@@ -726,6 +783,7 @@ async def _iterate_openai_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        batch_prompts=normalized.batch_prompts,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -750,6 +808,7 @@ async def _iterate_gemini_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        batch_prompts=normalized.batch_prompts,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -900,7 +959,7 @@ async def generate_content(
     """Gemini official generateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
-        if not normalized.prompt:
+        if not normalized.prompt and not normalized.batch_prompts:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
@@ -913,6 +972,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    batch_prompts=normalized.batch_prompts,
                 )
             )
         )
@@ -947,8 +1007,13 @@ async def stream_generate_content(
     """Gemini official streamGenerateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
-        if not normalized.prompt:
+        if not normalized.prompt and not normalized.batch_prompts:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+        if normalized.batch_prompts:
+            raise HTTPException(
+                status_code=400,
+                detail="batchPrompts is only supported for non-stream generateContent",
+            )
 
         request_base_url = _get_request_base_url(raw_request)
 
