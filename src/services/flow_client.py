@@ -20,6 +20,8 @@ try:
 except ImportError:
     httpx = None
 
+FLOW_PUBLIC_API_KEY = "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY"
+
 
 class FlowClient:
     """VideoFX API客户端"""
@@ -465,6 +467,40 @@ class FlowClient:
     def _get_video_poll_timeout(self) -> int:
         """视频状态查询是轻量轮询，请求超时不应超过下一轮轮询太久。"""
         return max(10, min(int(self.timeout or 0) or 120, 45))
+
+    async def get_media(self, at: str, media_id: str) -> Dict[str, Any]:
+        """获取单个媒体信息，常用于刷新/补取 signed media URL。"""
+        safe_media_id = quote(str(media_id or "").strip(), safe="")
+        if not safe_media_id:
+            raise ValueError("media_id is empty")
+
+        base_url = f"{self.api_base_url}/media/{safe_media_id}"
+        urls = [
+            f"{base_url}?clientContext.tool=PINHOLE",
+            f"{base_url}?key={FLOW_PUBLIC_API_KEY}&clientContext.tool=PINHOLE",
+        ]
+        last_error: Optional[Exception] = None
+
+        for url in urls:
+            try:
+                return await asyncio.wait_for(
+                    self._make_request(
+                        method="GET",
+                        url=url,
+                        use_at=True,
+                        at_token=at,
+                        timeout=self._get_video_poll_timeout(),
+                        allow_urllib_fallback=False,
+                    ),
+                    timeout=self._get_video_poll_timeout() + 5,
+                )
+            except Exception as e:
+                last_error = e
+                debug_logger.log_warning(f"[GET MEDIA] failed: {e}")
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("get_media failed")
 
     async def _make_video_api_request(
         self,
@@ -1467,8 +1503,8 @@ class FlowClient:
     def _extract_video_url_from_media(self, media: Dict[str, Any]) -> Optional[str]:
         video = media.get("video") if isinstance(media.get("video"), dict) else {}
         candidates = [
-            self._find_nested_string(video, ("fifeUrl", "videoUrl", "outputUri", "downloadUri")),
-            self._find_nested_string(media, ("fifeUrl", "videoUrl", "outputUri", "downloadUri")),
+            self._find_nested_string(video, ("fifeUrl", "servingUri", "videoUrl", "outputUri", "downloadUri")),
+            self._find_nested_string(media, ("fifeUrl", "servingUri", "videoUrl", "outputUri", "downloadUri")),
             self._find_nested_string(video, ("uri", "url")),
         ]
         for candidate in candidates:

@@ -1020,7 +1020,7 @@ class GenerationHandler:
     def _extract_video_url_from_operation(self, operation: Dict[str, Any]) -> Optional[str]:
         return self._find_nested_video_url(
             operation,
-            ("fifeUrl", "videoUrl", "outputUri", "downloadUri", "url", "uri"),
+            ("fifeUrl", "servingUri", "videoUrl", "outputUri", "downloadUri", "url", "uri"),
         )
 
     def _extract_video_details_from_operation(
@@ -1032,6 +1032,20 @@ class GenerationHandler:
         video_info = metadata.get("video") if isinstance(metadata.get("video"), dict) else {}
         video_url = video_info.get("fifeUrl") or self._extract_video_url_from_operation(operation)
         return metadata, video_info, video_url
+
+    def _extract_media_id_from_operation(
+        self,
+        operation: Dict[str, Any],
+        video_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        operation_body = operation.get("operation") if isinstance(operation.get("operation"), dict) else {}
+        candidate = (
+            (video_info or {}).get("mediaGenerationId")
+            or operation.get("mediaName")
+            or operation.get("name")
+            or operation_body.get("name")
+        )
+        return candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
 
     async def _wait_for_video_url_after_success(
         self,
@@ -1062,6 +1076,26 @@ class GenerationHandler:
                 },
             )
             await asyncio.sleep(poll_interval)
+
+            media_id = self._extract_media_id_from_operation(latest_operation, latest_video_info)
+            if media_id:
+                try:
+                    media_result = await self.flow_client.get_media(token.at, media_id)
+                    media_url = self._extract_video_url_from_operation(media_result)
+                    if media_url:
+                        latest_video_url = media_url
+                        latest_operation = {
+                            **latest_operation,
+                            "mediaLookup": media_result,
+                        }
+                        latest_metadata, latest_video_info, _ = self._extract_video_details_from_operation(latest_operation)
+                        break
+                    latest_operation = {
+                        **latest_operation,
+                        "mediaLookup": media_result,
+                    }
+                except Exception as e:
+                    debug_logger.log_warning(f"[VIDEO URL] get_media failed for {media_id}: {e}")
 
             result = await self.flow_client.check_video_status(token.at, retry_operations)
             checked_operations = result.get("operations", [])
