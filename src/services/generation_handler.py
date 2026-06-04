@@ -993,6 +993,36 @@ class GenerationHandler:
             return text
         return f"{text[:max_length - 3]}..."
 
+    def _is_video_url_candidate(self, value: Any) -> bool:
+        return isinstance(value, str) and (
+            value.startswith("http://")
+            or value.startswith("https://")
+            or value.startswith("/")
+        )
+
+    def _find_nested_video_url(self, value: Any, keys: Tuple[str, ...]) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in keys:
+                candidate = value.get(key)
+                if self._is_video_url_candidate(candidate):
+                    return candidate.strip()
+            for candidate in value.values():
+                found = self._find_nested_video_url(candidate, keys)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = self._find_nested_video_url(item, keys)
+                if found:
+                    return found
+        return None
+
+    def _extract_video_url_from_operation(self, operation: Dict[str, Any]) -> Optional[str]:
+        return self._find_nested_video_url(
+            operation,
+            ("fifeUrl", "videoUrl", "outputUri", "downloadUri", "url", "uri"),
+        )
+
     def _build_failed_batch_item(self, index: int, prompt: str, error_message: Any) -> Dict[str, Any]:
         """构建批量图片失败项。"""
         return {
@@ -2506,7 +2536,7 @@ class GenerationHandler:
                     # 成功
                     metadata = operation["operation"].get("metadata", {})
                     video_info = metadata.get("video", {})
-                    video_url = video_info.get("fifeUrl")
+                    video_url = video_info.get("fifeUrl") or self._extract_video_url_from_operation(operation)
                     # Extract short UUID from Google Storage URL (e.g., /video/UUID?)
                     # Both extend API and concat API need this short UUID format,
                     # NOT the CAUS base64 mediaGenerationId from video_info
@@ -2517,7 +2547,10 @@ class GenerationHandler:
 
                     if not video_url:
                         error_msg = "视频生成失败: 视频URL为空"
-                        error_extra = {"upstream_metadata": metadata}
+                        error_extra = {
+                            "upstream_metadata": metadata,
+                            "upstream_operation": operation,
+                        }
                         await self._fail_video_task(checked_operations, error_msg)
                         self._mark_generation_failed(generation_result, error_msg, error_extra=error_extra)
                         yield self._create_error_response(
