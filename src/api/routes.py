@@ -575,9 +575,13 @@ def _build_gemini_error_response_from_handler(payload: Dict[str, Any]) -> JSONRe
     error = payload.get("error", {})
     status_code = _get_error_status_code(payload)
     message = error.get("message", "Generation failed")
+    content = _build_gemini_error_payload(status_code, message)
+    for key, value in payload.items():
+        if key != "error":
+            content[key] = value
     return JSONResponse(
         status_code=status_code,
-        content=_build_gemini_error_payload(status_code, message),
+        content=content,
     )
 
 

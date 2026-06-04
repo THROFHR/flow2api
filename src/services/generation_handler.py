@@ -941,6 +941,7 @@ class GenerationHandler:
         return dict(
             success=False,
             error_message=None,
+            error_extra=None,
             error_emitted=False,
             usage_success=False,
             result_status="failed",
@@ -954,11 +955,17 @@ class GenerationHandler:
             "base_url": None,
         }
 
-    def _mark_generation_failed(self, generation_result: Optional[Dict[str, Any]], error_message: str):
+    def _mark_generation_failed(
+        self,
+        generation_result: Optional[Dict[str, Any]],
+        error_message: str,
+        error_extra: Optional[Dict[str, Any]] = None,
+    ):
         """????????????????????"""
         if isinstance(generation_result, dict):
             generation_result["success"] = False
             generation_result["error_message"] = error_message
+            generation_result["error_extra"] = error_extra
             generation_result["error_emitted"] = True
             generation_result["usage_success"] = False
             generation_result["result_status"] = "failed"
@@ -1517,11 +1524,15 @@ class GenerationHandler:
                 perf_trace["status"] = "failed"
                 perf_trace["total_ms"] = int(duration * 1000)
                 perf_trace["error"] = error_msg
+                error_extra = generation_result.get("error_extra") if isinstance(generation_result, dict) else None
+                response_data = {"error": error_msg, "performance": perf_trace}
+                if isinstance(error_extra, dict):
+                    response_data.update(error_extra)
                 await self._log_request(
                     token.id if token else None,
                     request_operation,
                     request_payload,
-                    {"error": error_msg, "performance": perf_trace},
+                    response_data,
                     500,
                     duration,
                     log_id=request_log_state.get("id"),
@@ -1531,7 +1542,7 @@ class GenerationHandler:
                 if not generation_result.get("error_emitted"):
                     if stream:
                         yield self._create_stream_chunk(f"❌ {error_msg}\n")
-                    yield self._create_error_response(error_msg, status_code=500)
+                    yield self._create_error_response(error_msg, status_code=500, extra=error_extra)
                 return
 
             result_status = str(generation_result.get("result_status") or "success")
@@ -2506,9 +2517,14 @@ class GenerationHandler:
 
                     if not video_url:
                         error_msg = "视频生成失败: 视频URL为空"
+                        error_extra = {"upstream_metadata": metadata}
                         await self._fail_video_task(checked_operations, error_msg)
-                        self._mark_generation_failed(generation_result, error_msg)
-                        yield self._create_error_response(error_msg, status_code=502, extra={"metadata": metadata},)
+                        self._mark_generation_failed(generation_result, error_msg, error_extra=error_extra)
+                        yield self._create_error_response(
+                            error_msg,
+                            status_code=502,
+                            extra=error_extra,
+                        )
                         return
 
                     # ========== 视频放大处理 ==========
