@@ -483,7 +483,7 @@ class FlowClient:
 
         for url in urls:
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self._make_request(
                         method="GET",
                         url=url,
@@ -494,9 +494,20 @@ class FlowClient:
                     ),
                     timeout=self._get_video_poll_timeout() + 5,
                 )
+                try:
+                    print(
+                        "[GET_MEDIA_RESPONSE] "
+                        f"media_id={media_id}, url={url}, "
+                        f"result={json.dumps(result, ensure_ascii=False)[:5000]}",
+                        flush=True,
+                    )
+                except Exception as log_error:
+                    print(f"[GET_MEDIA_RESPONSE] failed to print result: {log_error}", flush=True)
+                return result
             except Exception as e:
                 last_error = e
                 debug_logger.log_warning(f"[GET MEDIA] failed: {e}")
+                print(f"[GET_MEDIA_RESPONSE] failed media_id={media_id}, url={url}, error={e}", flush=True)
 
         if last_error is not None:
             raise last_error
@@ -1612,15 +1623,6 @@ class FlowClient:
         result: Dict[str, Any],
         fallback_project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        try:
-            print(
-                "[NORMALIZE_VIDEO_RESPONSE] "
-                f"fallback_project_id={fallback_project_id}, "
-                f"result={json.dumps(result, ensure_ascii=False)[:5000]}",
-                flush=True,
-            )
-        except Exception as log_error:
-            print(f"[NORMALIZE_VIDEO_RESPONSE] failed to print params: {log_error}", flush=True)
 
         if not isinstance(result, dict):
             return result
