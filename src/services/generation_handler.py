@@ -1023,6 +1023,57 @@ class GenerationHandler:
             ("fifeUrl", "videoUrl", "outputUri", "downloadUri", "url", "uri"),
         )
 
+    def _extract_video_details_from_operation(
+        self,
+        operation: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[str]]:
+        operation_body = operation.get("operation") if isinstance(operation.get("operation"), dict) else {}
+        metadata = operation_body.get("metadata") if isinstance(operation_body.get("metadata"), dict) else {}
+        video_info = metadata.get("video") if isinstance(metadata.get("video"), dict) else {}
+        video_url = video_info.get("fifeUrl") or self._extract_video_url_from_operation(operation)
+        return metadata, video_info, video_url
+
+    async def _wait_for_video_url_after_success(
+        self,
+        token,
+        operations: List[Dict[str, Any]],
+        initial_operation: Dict[str, Any],
+        poll_interval: float,
+        request_log_state: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[str]]:
+        latest_operation = initial_operation
+        latest_metadata, latest_video_info, latest_video_url = self._extract_video_details_from_operation(latest_operation)
+        retry_operations = [latest_operation] if latest_operation else operations
+        max_url_attempts = max(3, min(10, int(30 / max(float(poll_interval), 1.0))))
+
+        for attempt in range(max_url_attempts):
+            if latest_video_url:
+                break
+
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text="video_url_pending",
+                progress=90,
+                response_extra={
+                    "mediaGenerationId": latest_video_info.get("mediaGenerationId"),
+                    "url_retry_attempt": attempt + 1,
+                    "url_retry_max": max_url_attempts,
+                },
+            )
+            await asyncio.sleep(poll_interval)
+
+            result = await self.flow_client.check_video_status(token.at, retry_operations)
+            checked_operations = result.get("operations", [])
+            if not checked_operations:
+                continue
+
+            latest_operation = checked_operations[0]
+            latest_metadata, latest_video_info, latest_video_url = self._extract_video_details_from_operation(latest_operation)
+            retry_operations = [latest_operation]
+
+        return latest_operation, latest_metadata, latest_video_info, latest_video_url
+
     def _build_failed_batch_item(self, index: int, prompt: str, error_message: Any) -> Dict[str, Any]:
         """构建批量图片失败项。"""
         return {
@@ -2534,9 +2585,17 @@ class GenerationHandler:
                 # 检查状态
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
                     # 成功
-                    metadata = operation["operation"].get("metadata", {})
-                    video_info = metadata.get("video", {})
-                    video_url = video_info.get("fifeUrl") or self._extract_video_url_from_operation(operation)
+                    metadata, video_info, video_url = self._extract_video_details_from_operation(operation)
+                    if not video_url:
+                        if stream:
+                            yield self._create_stream_chunk("视频已生成，正在等待下载链接...\n")
+                        operation, metadata, video_info, video_url = await self._wait_for_video_url_after_success(
+                            token,
+                            checked_operations,
+                            operation,
+                            poll_interval,
+                            request_log_state,
+                        )
                     # Extract short UUID from Google Storage URL (e.g., /video/UUID?)
                     # Both extend API and concat API need this short UUID format,
                     # NOT the CAUS base64 mediaGenerationId from video_info
@@ -2551,7 +2610,7 @@ class GenerationHandler:
                             "upstream_metadata": metadata,
                             "upstream_operation": operation,
                         }
-                        await self._fail_video_task(checked_operations, error_msg)
+                        await self._fail_video_task([operation], error_msg)
                         self._mark_generation_failed(generation_result, error_msg, error_extra=error_extra)
                         yield self._create_error_response(
                             error_msg,
