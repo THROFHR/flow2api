@@ -1612,6 +1612,16 @@ class FlowClient:
         result: Dict[str, Any],
         fallback_project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        try:
+            print(
+                "[NORMALIZE_VIDEO_RESPONSE] "
+                f"fallback_project_id={fallback_project_id}, "
+                f"result={json.dumps(result, ensure_ascii=False)[:5000]}",
+                flush=True,
+            )
+        except Exception as log_error:
+            print(f"[NORMALIZE_VIDEO_RESPONSE] failed to print params: {log_error}", flush=True)
+
         if not isinstance(result, dict):
             return result
 
