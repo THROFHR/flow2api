@@ -494,15 +494,6 @@ class FlowClient:
                     ),
                     timeout=self._get_video_poll_timeout() + 5,
                 )
-                try:
-                    print(
-                        "[GET_MEDIA_RESPONSE] "
-                        f"media_id={media_id}, url={url}, "
-                        f"result={json.dumps(result, ensure_ascii=False)[:5000]}",
-                        flush=True,
-                    )
-                except Exception as log_error:
-                    print(f"[GET_MEDIA_RESPONSE] failed to print result: {log_error}", flush=True)
                 return result
             except Exception as e:
                 last_error = e
