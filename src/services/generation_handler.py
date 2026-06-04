@@ -1023,6 +1023,41 @@ class GenerationHandler:
             ("fifeUrl", "servingUri", "videoUrl", "outputUri", "downloadUri", "url", "uri"),
         )
 
+    def _find_nested_string_value(self, value: Any, key: str) -> Optional[str]:
+        if isinstance(value, dict):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+            for nested in value.values():
+                found = self._find_nested_string_value(nested, key)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = self._find_nested_string_value(item, key)
+                if found:
+                    return found
+        return None
+
+    def _save_encoded_video_to_tmp(
+        self,
+        encoded_video: str,
+        media_id: Optional[str],
+        response_state: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if not encoded_video:
+            return None
+
+        safe_media_id = "".join(
+            ch for ch in str(media_id or "video") if ch.isalnum() or ch in ("-", "_")
+        )[:80] or "video"
+        tmp_dir = Path(__file__).resolve().parents[2] / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"encoded_video_{safe_media_id}_{int(time.time())}.mp4"
+        file_path = tmp_dir / filename
+        file_path.write_bytes(base64.b64decode(encoded_video))
+        return f"{self._get_base_url(response_state)}/tmp/{filename}"
+
     def _extract_video_details_from_operation(
         self,
         operation: Dict[str, Any],
@@ -1054,11 +1089,12 @@ class GenerationHandler:
         initial_operation: Dict[str, Any],
         poll_interval: float,
         request_log_state: Optional[Dict[str, Any]] = None,
+        response_state: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[str]]:
         latest_operation = initial_operation
         latest_metadata, latest_video_info, latest_video_url = self._extract_video_details_from_operation(latest_operation)
         retry_operations = [latest_operation] if latest_operation else operations
-        max_url_attempts = max(3, min(10, int(30 / max(float(poll_interval), 1.0))))
+        max_url_attempts = max(1, min(10, int(10 / max(float(poll_interval), 1.0))))
 
         for attempt in range(max_url_attempts):
             if latest_video_url:
@@ -1082,6 +1118,13 @@ class GenerationHandler:
                 try:
                     media_result = await self.flow_client.get_media(token.at, media_id)
                     media_url = self._extract_video_url_from_operation(media_result)
+                    if not media_url:
+                        encoded_video = self._find_nested_string_value(media_result, "encodedVideo")
+                        media_url = self._save_encoded_video_to_tmp(
+                            encoded_video or "",
+                            media_id,
+                            response_state,
+                        )
                     if media_url:
                         latest_video_url = media_url
                         latest_operation = {
@@ -2629,6 +2672,7 @@ class GenerationHandler:
                             operation,
                             poll_interval,
                             request_log_state,
+                            response_state,
                         )
                     # Extract short UUID from Google Storage URL (e.g., /video/UUID?)
                     # Both extend API and concat API need this short UUID format,
@@ -2756,7 +2800,8 @@ class GenerationHandler:
 
                     # 缓存视频 (如果启用)
                     local_url = video_url
-                    if config.cache_enabled:
+                    is_local_encoded_video = "/tmp/encoded_video_" in (video_url or "")
+                    if config.cache_enabled and not is_local_encoded_video:
                         await self._update_request_log_progress(request_log_state, token_id=token.id, status_text="caching_video", progress=92)
                         try:
                             if stream:
@@ -2773,7 +2818,7 @@ class GenerationHandler:
                                 cache_error = self._normalize_error_message(e, max_length=120)
                                 yield self._create_stream_chunk(f"⚠️ 缓存失败: {cache_error}\n正在返回源链接...\n")
                     else:
-                        if stream:
+                        if stream and not is_local_encoded_video:
                             yield self._create_stream_chunk("缓存已关闭,正在返回源链接...\n")
 
                     # 更新数据库
