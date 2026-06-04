@@ -2508,7 +2508,7 @@ class GenerationHandler:
                         error_msg = "视频生成失败: 视频URL为空"
                         await self._fail_video_task(checked_operations, error_msg)
                         self._mark_generation_failed(generation_result, error_msg)
-                        yield self._create_error_response(error_msg, status_code=502)
+                        yield self._create_error_response(error_msg, status_code=502, extra={"metadata": metadata},)
                         return
 
                     # ========== 视频放大处理 ==========
@@ -2842,7 +2842,12 @@ class GenerationHandler:
 
         return json.dumps(response, ensure_ascii=False)
 
-    def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
+    def _create_error_response(
+        self,
+        error_message: str,
+        status_code: int = 500,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """创建错误响应"""
         import json
 
@@ -2854,6 +2859,8 @@ class GenerationHandler:
                 "status_code": status_code,
             }
         }
+        if extra:
+            error.update(extra)
 
         return json.dumps(error, ensure_ascii=False)
 
