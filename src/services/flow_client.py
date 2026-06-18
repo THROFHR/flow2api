@@ -3292,6 +3292,14 @@ class FlowClient:
         """
         captcha_method = config.captcha_method
         debug_logger.log_info(f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, action={action}")
+        token_level_captcha_proxy_url = None
+        if token_id and self.db:
+            try:
+                token_row = await self.db.get_token(token_id)
+                if token_row and getattr(token_row, "captcha_proxy_url", None):
+                    token_level_captcha_proxy_url = str(getattr(token_row, "captcha_proxy_url", "") or "").strip() or None
+            except Exception as e:
+                debug_logger.log_warning(f"[reCAPTCHA] 读取 token({token_id}) 打码代理失败: {e}")
         await self._emit_debug_event(
             "captcha_start",
             {
@@ -3299,6 +3307,7 @@ class FlowClient:
                 "project_id": project_id,
                 "action": action,
                 "token_id": token_id,
+                "captcha_proxy_url": token_level_captcha_proxy_url,
             },
         )
 
@@ -3482,8 +3491,8 @@ class FlowClient:
                 return None, None
         elif captcha_method == "remote_browser":
             try:
-                explicit_proxy_url = None
-                if self.proxy_manager:
+                explicit_proxy_url = token_level_captcha_proxy_url
+                if explicit_proxy_url is None and self.proxy_manager:
                     try:
                         explicit_proxy_url = await self.proxy_manager.get_request_proxy_url()
                     except Exception as e:
