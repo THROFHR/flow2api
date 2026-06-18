@@ -121,6 +121,29 @@ class FlowClient:
         except Exception as exc:
             debug_logger.log_warning(f"[FLOW DEBUG] emit failed: {exc}")
 
+    def _mask_proxy_url(self, proxy_url: Optional[str]) -> Optional[str]:
+        if not proxy_url:
+            return None
+        text = str(proxy_url).strip()
+        if not text:
+            return None
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+
+            parts = urlsplit(text)
+            hostname = parts.hostname or ""
+            port = f":{parts.port}" if parts.port else ""
+            auth = ""
+            if parts.username:
+                auth = parts.username
+                if parts.password:
+                    auth += ":***"
+                auth += "@"
+            netloc = f"{auth}{hostname}{port}"
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        except Exception:
+            return text
+
     async def _make_request(
         self,
         method: str,
@@ -169,6 +192,15 @@ class FlowClient:
                 proxy_url = fingerprint.get("proxy_url")
                 if proxy_url == "":
                     proxy_url = None
+        proxy_source = "direct"
+        if force_no_proxy:
+            proxy_source = "force_no_proxy"
+        elif respect_fingerprint_proxy and isinstance(fingerprint, dict) and "proxy_url" in fingerprint:
+            proxy_source = "captcha_fingerprint"
+        elif use_media_proxy and proxy_url:
+            proxy_source = "media_proxy"
+        elif proxy_url:
+            proxy_source = "request_proxy"
         request_timeout = timeout or self.timeout
 
         if headers is None:
@@ -246,6 +278,25 @@ class FlowClient:
                 body=json_data,
                 proxy=proxy_url
             )
+
+        await self._emit_debug_event(
+            "http_request_context",
+            {
+                "method": method.upper(),
+                "url": url,
+                "proxy_source": proxy_source,
+                "proxy_url": self._mask_proxy_url(proxy_url) or "direct",
+                "use_media_proxy": bool(use_media_proxy),
+                "respect_fingerprint_proxy": bool(respect_fingerprint_proxy),
+                "force_no_proxy": bool(force_no_proxy),
+                "fingerprint_proxy_url": self._mask_proxy_url(
+                    fingerprint.get("proxy_url") if isinstance(fingerprint, dict) else None
+                ) or "direct",
+                "fingerprint_locale": fingerprint.get("locale") if isinstance(fingerprint, dict) else None,
+                "fingerprint_timezone": fingerprint.get("timezone_id") if isinstance(fingerprint, dict) else None,
+                "user_agent": headers.get("User-Agent"),
+            },
+        )
 
         start_time = time.time()
 

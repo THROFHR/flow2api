@@ -1577,6 +1577,7 @@ class GenerationHandler:
 
         async def _flow_debug_hook(event: str, payload: Dict[str, Any]):
             title_map = {
+                "selected_token": "已选账号",
                 "image_upload_prepare": "上传图片准备",
                 "image_upload_request": "上传图片请求",
                 "image_upload_response": "上传图片响应",
@@ -1585,6 +1586,7 @@ class GenerationHandler:
                 "captcha_start": "开始打码",
                 "captcha_result": "打码结果",
                 "captcha_error": "打码失败",
+                "http_request_context": "实际请求上下文",
                 "image_submit_request": "提交生图请求",
                 "image_submit_response": "生图请求响应",
                 "image_submit_error": "生图请求失败",
@@ -1727,6 +1729,26 @@ class GenerationHandler:
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
         pending_token_state["active"] = True
+        selected_token_chunk = await self._emit_debug_progress(
+            response_state=response_state,
+            stream=stream,
+            request_log_state=request_log_state,
+            token_id=token.id,
+            event="selected_token",
+            title="已选账号",
+            payload={
+                "token_id": token.id,
+                "email": token.email,
+                "current_project_id": getattr(token, "current_project_id", None),
+                "image_enabled": getattr(token, "image_enabled", None),
+                "video_enabled": getattr(token, "video_enabled", None),
+                "image_concurrency": getattr(token, "image_concurrency", None),
+                "video_concurrency": getattr(token, "video_concurrency", None),
+                "captcha_proxy_url": getattr(token, "captcha_proxy_url", None),
+            },
+        )
+        if selected_token_chunk:
+            yield_queue.append(selected_token_chunk)
         await self._update_request_log_progress(
             request_log_state,
             token_id=token.id,
