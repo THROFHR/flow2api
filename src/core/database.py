@@ -1077,6 +1077,26 @@ class Database:
             rows = await cursor.fetchall()
             return [Project(**dict(row)) for row in rows]
 
+    async def replace_projects_for_token(self, token_id: int, projects: List[Project]):
+        """Replace all projects for a token atomically."""
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
+            for project in projects:
+                await db.execute(
+                    """
+                    INSERT INTO projects (project_id, token_id, project_name, tool_name, is_active)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project.project_id,
+                        token_id,
+                        project.project_name,
+                        project.tool_name,
+                        project.is_active,
+                    ),
+                )
+            await db.commit()
+
     async def delete_project(self, project_id: str):
         """Delete project"""
         async with self._connect(write=True) as db:
