@@ -1627,10 +1627,17 @@ class GenerationHandler:
                 response_extra={"project_id": project_id},
             )
             prefill_action = "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
+            prefill_proxy_url = str(getattr(token, "captcha_proxy_url", "") or "").strip() or None
+            if prefill_proxy_url is None and self.proxy_manager:
+                try:
+                    prefill_proxy_url = await self.proxy_manager.get_request_proxy_url()
+                except Exception as e:
+                    debug_logger.log_warning(f"[GENERATION] 获取 remote_browser prefill 代理失败: {e}")
             await self.flow_client.prefill_remote_browser_pool(
                 project_id=project_id,
                 action=prefill_action,
                 token_id=token.id,
+                proxy_url=prefill_proxy_url,
             )
 
             # 5. 根据类型处理

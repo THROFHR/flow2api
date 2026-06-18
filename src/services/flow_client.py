@@ -2992,6 +2992,7 @@ class FlowClient:
         project_id: str,
         action: str = "IMAGE_GENERATION",
         token_id: Optional[int] = None,
+        proxy_url: Optional[str] = None,
         *,
         cooldown_seconds: float = 8.0,
     ) -> bool:
@@ -3004,7 +3005,8 @@ class FlowClient:
         if not normalized_project:
             return False
 
-        cache_key = f"{normalized_project}|{normalized_action}|{int(token_id or 0)}"
+        normalized_proxy = str(proxy_url or "").strip()
+        cache_key = f"{normalized_project}|{normalized_action}|{int(token_id or 0)}|{normalized_proxy}"
         now_value = time.monotonic()
         last_sent = float(self._remote_browser_prefill_last_sent.get(cache_key, 0.0) or 0.0)
         if (now_value - last_sent) < max(0.5, float(cooldown_seconds)):
@@ -3018,6 +3020,7 @@ class FlowClient:
                     "project_id": normalized_project,
                     "action": normalized_action,
                     "token_id": token_id,
+                    "proxy_url": normalized_proxy or None,
                 },
                 timeout_override=3,
             )
@@ -3160,6 +3163,12 @@ class FlowClient:
                 return None, None
         elif captcha_method == "remote_browser":
             try:
+                explicit_proxy_url = None
+                if self.proxy_manager:
+                    try:
+                        explicit_proxy_url = await self.proxy_manager.get_request_proxy_url()
+                    except Exception as e:
+                        debug_logger.log_warning(f"[reCAPTCHA RemoteBrowser] 获取请求代理失败: {e}")
                 solve_timeout = self._resolve_remote_browser_solve_timeout(action)
                 payload = await self._call_remote_browser_service(
                     method="POST",
@@ -3168,6 +3177,7 @@ class FlowClient:
                         "project_id": project_id,
                         "action": action,
                         "token_id": token_id,
+                        "proxy_url": explicit_proxy_url,
                     },
                     timeout_override=solve_timeout,
                 )
