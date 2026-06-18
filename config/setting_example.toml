@@ -1,14 +1,14 @@
 [global]
-api_key = "han1234"
+api_key = "1qasw23ed!"
 admin_username = "admin"
-admin_password = "admin"
+admin_password = "demo@1234"
 
 [flow]
 labs_base_url = "https://labs.google/fx/api"
 api_base_url = "https://aisandbox-pa.googleapis.com/v1"
-timeout = 120
+timeout = 180
 max_retries = 3
-image_request_timeout = 100
+image_request_timeout = 180
 image_timeout_retry_count = 0
 image_timeout_retry_delay = 0.8
 image_timeout_use_media_proxy_fallback = true
@@ -21,7 +21,7 @@ video_slot_wait_timeout = 480
 video_launch_soft_limit = 20
 video_launch_wait_timeout = 480
 video_launch_stagger_ms = 0
-poll_interval = 3.0
+poll_interval = 5.0
 max_poll_attempts = 200
 
 [server]
@@ -57,7 +57,7 @@ base_url = ""   # 缓存文件访问的基础URL, 留空则使用服务器地址
 captcha_method = "extension"  # 打码方式: extension/yescaptcha/browser/personal/remote_browser
 browser_recaptcha_settle_seconds = 3.0  # reload/clr 就绪后的额外稳态等待
 browser_count = 1  # browser 模式的有头浏览器实例数量
-personal_project_pool_size = 4  # personal 模式下单个 Token 默认维护的项目池数量（仅影响项目轮换，不决定打码标签页数量）
+personal_project_pool_size = 1  # personal 模式下单个 Token 默认维护的项目池数量（仅影响项目轮换，不决定打码标签页数量）
 personal_max_resident_tabs = 5  # personal 模式共享打码标签页上限，所有 Token/project 共用这组 tab
 browser_personal_fresh_restart_every_n_solves = 10  # personal 模式成功获取多少个码后清理并重启浏览器，0 表示禁用
 personal_idle_tab_ttl_seconds = 600  # personal 模式标签页空闲回收时间(秒)
