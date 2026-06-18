@@ -40,6 +40,10 @@ class FlowClient:
             default=None
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
+        self._debug_hook_ctx: contextvars.ContextVar[Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]] = contextvars.ContextVar(
+            "flow_debug_hook",
+            default=None,
+        )
 
         # Default "real browser" headers (macOS Chrome Desktop) to reduce upstream 4xx/5xx instability.
         # These will be applied as defaults (won't override caller-provided headers).
@@ -103,6 +107,19 @@ class FlowClient:
     def clear_request_fingerprint(self):
         """清理请求链路绑定的浏览器指纹。"""
         self._set_request_fingerprint(None)
+
+    def set_debug_hook(self, hook: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]):
+        """设置当前请求链路的调试事件回调。"""
+        self._debug_hook_ctx.set(hook)
+
+    async def _emit_debug_event(self, event: str, payload: Dict[str, Any]):
+        hook = self._debug_hook_ctx.get()
+        if not callable(hook):
+            return
+        try:
+            await hook(event, payload)
+        except Exception as exc:
+            debug_logger.log_warning(f"[FLOW DEBUG] emit failed: {exc}")
 
     async def _make_request(
         self,
@@ -483,6 +500,13 @@ class FlowClient:
 
         for url in urls:
             try:
+                await self._emit_debug_event(
+                    "image_media_check_request",
+                    {
+                        "media_id": media_id,
+                        "endpoint": url,
+                    },
+                )
                 result = await asyncio.wait_for(
                     self._make_request(
                         method="GET",
@@ -494,11 +518,27 @@ class FlowClient:
                     ),
                     timeout=self._get_video_poll_timeout() + 5,
                 )
+                await self._emit_debug_event(
+                    "image_media_check_response",
+                    {
+                        "media_id": media_id,
+                        "endpoint": url,
+                        "response": result,
+                    },
+                )
                 return result
             except Exception as e:
                 last_error = e
                 debug_logger.log_warning(f"[GET MEDIA] failed: {e}")
                 print(f"[GET_MEDIA_RESPONSE] failed media_id={media_id}, url={url}, error={e}", flush=True)
+                await self._emit_debug_event(
+                    "image_media_check_error",
+                    {
+                        "media_id": media_id,
+                        "endpoint": url,
+                        "error": str(e),
+                    },
+                )
 
         if last_error is not None:
             raise last_error
@@ -608,6 +648,16 @@ class FlowClient:
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
+                await self._emit_debug_event(
+                    "image_submit_request",
+                    {
+                        "attempt": attempt_index + 1,
+                        "endpoint": url,
+                        "route": route_label,
+                        "timeout_seconds": request_timeout,
+                        "request": json_data,
+                    },
+                )
                 result = await self._make_request(
                     method="POST",
                     url=url,
@@ -622,6 +672,15 @@ class FlowClient:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
                     http_attempt_info["success"] = True
                     attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
+                await self._emit_debug_event(
+                    "image_submit_response",
+                    {
+                        "attempt": attempt_index + 1,
+                        "endpoint": url,
+                        "route": route_label,
+                        "response": result,
+                    },
+                )
                 return result
             except Exception as e:
                 last_error = e
@@ -631,6 +690,15 @@ class FlowClient:
                     http_attempt_info["timeout_error"] = bool(self._is_timeout_error(e))
                     http_attempt_info["error"] = str(e)[:240]
                     attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
+                await self._emit_debug_event(
+                    "image_submit_error",
+                    {
+                        "attempt": attempt_index + 1,
+                        "endpoint": url,
+                        "route": route_label,
+                        "error": str(e),
+                    },
+                )
                 if not self._is_timeout_error(e) or attempt_index >= total_attempts - 1:
                     raise
 
@@ -924,6 +992,26 @@ class FlowClient:
         max_retries = config.flow_max_retries
         last_error: Optional[Exception] = None
 
+        await self._emit_debug_event(
+            "image_upload_prepare",
+            {
+                "endpoint": new_url,
+                "project_id": normalized_project_id or None,
+                "aspect_ratio": aspect_ratio,
+                "mime_type": mime_type,
+                "image_bytes_length": len(image_bytes),
+                "base64_length": len(image_base64),
+                "request": {
+                    "clientContext": new_client_context,
+                    "fileName": upload_file_name,
+                    "mimeType": mime_type,
+                    "isHidden": False,
+                    "isUserUploaded": True,
+                    "imageBytes": f"<base64 length={len(image_base64)}>",
+                },
+            },
+        )
+
         captcha_method = getattr(config, "captcha_method", "personal")
         if captcha_method == "personal":
             try:
@@ -939,6 +1027,21 @@ class FlowClient:
 
         for retry_attempt in range(max_retries):
             try:
+                await self._emit_debug_event(
+                    "image_upload_request",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "endpoint": new_url,
+                        "request": {
+                            "clientContext": new_client_context,
+                            "fileName": upload_file_name,
+                            "mimeType": mime_type,
+                            "isHidden": False,
+                            "isUserUploaded": True,
+                            "imageBytes": f"<base64 length={len(image_base64)}>",
+                        },
+                    },
+                )
                 new_result = await self._make_request(
                     method="POST",
                     url=new_url,
@@ -951,11 +1054,28 @@ class FlowClient:
                     self._extract_media_name(new_result.get("media"))
                     or new_result.get("mediaGenerationId", {}).get("mediaGenerationId")
                 )
+                await self._emit_debug_event(
+                    "image_upload_response",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "endpoint": new_url,
+                        "media_id": media_id,
+                        "response": new_result,
+                    },
+                )
                 if media_id:
                     return media_id
                 raise Exception(f"Invalid upload response: missing media id, keys={list(new_result.keys())}")
             except Exception as new_upload_error:
                 last_error = new_upload_error
+                await self._emit_debug_event(
+                    "image_upload_error",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "endpoint": new_url,
+                        "error": str(new_upload_error),
+                    },
+                )
                 retry_reason = "网络超时" if self._is_timeout_error(new_upload_error) else self._get_retry_reason(str(new_upload_error))
 
                 # 旧接口不携带 projectId，带项目上下文的上传一旦回退就可能把图片挂到错误项目。
@@ -976,8 +1096,32 @@ class FlowClient:
                 debug_logger.log_warning(
                     f"[UPLOAD] New upload API failed, fallback to legacy endpoint: {new_upload_error}"
                 )
+                await self._emit_debug_event(
+                    "image_upload_fallback",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "fallback_endpoint": legacy_url,
+                        "reason": str(new_upload_error),
+                    },
+                )
 
             try:
+                await self._emit_debug_event(
+                    "image_upload_request",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "endpoint": legacy_url,
+                        "request": {
+                            "imageInput": {
+                                "rawImageBytes": f"<base64 length={len(image_base64)}>",
+                                "mimeType": mime_type,
+                                "isUserUploaded": True,
+                                "aspectRatio": aspect_ratio,
+                            },
+                            "clientContext": legacy_json_data["clientContext"],
+                        },
+                    },
+                )
                 legacy_result = await self._make_request(
                     method="POST",
                     url=legacy_url,
@@ -991,11 +1135,28 @@ class FlowClient:
                     legacy_result.get("mediaGenerationId", {}).get("mediaGenerationId")
                     or legacy_result.get("media", {}).get("name")
                 )
+                await self._emit_debug_event(
+                    "image_upload_response",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "endpoint": legacy_url,
+                        "media_id": media_id,
+                        "response": legacy_result,
+                    },
+                )
                 if media_id:
                     return media_id
                 raise Exception(f"Legacy upload response missing media id: keys={list(legacy_result.keys())}")
             except Exception as legacy_upload_error:
                 last_error = legacy_upload_error
+                await self._emit_debug_event(
+                    "image_upload_error",
+                    {
+                        "attempt": retry_attempt + 1,
+                        "endpoint": legacy_url,
+                        "error": str(legacy_upload_error),
+                    },
+                )
                 retry_reason = self._get_retry_reason(str(legacy_upload_error))
                 if retry_reason and retry_attempt < max_retries - 1:
                     debug_logger.log_warning(
@@ -3077,6 +3238,15 @@ class FlowClient:
         """
         captcha_method = config.captcha_method
         debug_logger.log_info(f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, action={action}")
+        await self._emit_debug_event(
+            "captcha_start",
+            {
+                "method": captcha_method,
+                "project_id": project_id,
+                "action": action,
+                "token_id": token_id,
+            },
+        )
 
         if captcha_method == "extension":
             try:
@@ -3090,10 +3260,30 @@ class FlowClient:
                     token_id=token_id
                 )
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_result",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "success": bool(token),
+                        "browser_id": None,
+                        "token": token,
+                    },
+                )
                 return token, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": str(e),
+                    },
+                )
                 return None, None
 
         # 内置浏览器打码 (nodriver)
@@ -3116,6 +3306,18 @@ class FlowClient:
                 debug_logger.log_info(f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}...")
                 fingerprint = service.get_last_fingerprint() if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
+                await self._emit_debug_event(
+                    "captcha_result",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "success": bool(token),
+                        "browser_id": None,
+                        "token": token,
+                        "fingerprint": fingerprint,
+                    },
+                )
                 return token, None
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
@@ -3123,15 +3325,42 @@ class FlowClient:
                 debug_logger.log_error(f"[reCAPTCHA Personal] {error_msg}")
                 print(f"[reCAPTCHA] ❌ 内置浏览器打码失败: {error_msg}")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": error_msg,
+                    },
+                )
                 return None, None
             except ImportError as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 导入失败: {str(e)}")
                 print(f"[reCAPTCHA] ❌ nodriver 未安装，请运行: pip install nodriver")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": str(e),
+                    },
+                )
                 return None, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Personal] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": str(e),
+                    },
+                )
                 return None, None
         # 有头浏览器打码 (playwright)
         elif captcha_method == "browser":
@@ -3141,6 +3370,18 @@ class FlowClient:
                 token, browser_id = await service.get_token(project_id, action, token_id=token_id)
                 fingerprint = await service.get_fingerprint(browser_id) if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
+                await self._emit_debug_event(
+                    "captcha_result",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "success": bool(token),
+                        "browser_id": browser_id,
+                        "token": token,
+                        "fingerprint": fingerprint,
+                    },
+                )
                 return token, browser_id
             except RuntimeError as e:
                 # 捕获 Docker 环境或依赖缺失的明确错误
@@ -3148,15 +3389,42 @@ class FlowClient:
                 debug_logger.log_error(f"[reCAPTCHA Browser] {error_msg}")
                 print(f"[reCAPTCHA] ❌ 有头浏览器打码失败: {error_msg}")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": error_msg,
+                    },
+                )
                 return None, None
             except ImportError as e:
                 debug_logger.log_error(f"[reCAPTCHA Browser] 导入失败: {str(e)}")
                 print(f"[reCAPTCHA] ❌ playwright 未安装，请运行: pip install playwright && python -m playwright install chromium")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": str(e),
+                    },
+                )
                 return None, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Browser] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": str(e),
+                    },
+                )
                 return None, None
         elif captcha_method == "remote_browser":
             try:
@@ -3177,10 +3445,31 @@ class FlowClient:
                 self._set_request_fingerprint(fingerprint if token else None)
                 if not token or not session_id:
                     raise RuntimeError(f"remote_browser 返回缺少 token/session_id: {payload}")
+                await self._emit_debug_event(
+                    "captcha_result",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "success": True,
+                        "browser_id": str(session_id),
+                        "token": token,
+                        "response": payload,
+                    },
+                )
                 return token, str(session_id)
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA RemoteBrowser] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
+                await self._emit_debug_event(
+                    "captcha_error",
+                    {
+                        "method": captcha_method,
+                        "project_id": project_id,
+                        "action": action,
+                        "error": str(e),
+                    },
+                )
                 return None, None
         # API打码服务
         elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
@@ -3198,10 +3487,30 @@ class FlowClient:
             else:
                 self._set_request_fingerprint(None)
             token = await self._get_api_captcha_token(captcha_method, project_id, action)
+            await self._emit_debug_event(
+                "captcha_result",
+                {
+                    "method": captcha_method,
+                    "project_id": project_id,
+                    "action": action,
+                    "success": bool(token),
+                    "browser_id": None,
+                    "token": token,
+                },
+            )
             return token, None
         else:
             debug_logger.log_info(f"[reCAPTCHA] 未知的打码方式: {captcha_method}")
             self._set_request_fingerprint(None)
+            await self._emit_debug_event(
+                "captcha_error",
+                {
+                    "method": captcha_method,
+                    "project_id": project_id,
+                    "action": action,
+                    "error": "unknown captcha method",
+                },
+            )
             return None, None
 
     async def _get_api_captcha_token(self, method: str, project_id: str, action: str = "IMAGE_GENERATION") -> Optional[str]:

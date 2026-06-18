@@ -3,8 +3,9 @@ import asyncio
 import base64
 import json
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, AsyncGenerator, List, Dict, Any, Tuple
+from typing import Optional, AsyncGenerator, List, Dict, Any, Tuple, Callable, Awaitable
 from ..core.logger import debug_logger
 from ..core.config import config
 from ..core.monitoring import record_generation_result
@@ -953,6 +954,8 @@ class GenerationHandler:
             "url": None,
             "generated_assets": None,
             "base_url": None,
+            "debug_enabled": False,
+            "debug_include_media_check": True,
         }
 
     def _mark_generation_failed(
@@ -992,6 +995,120 @@ class GenerationHandler:
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
+
+    def _truncate_debug_text(self, value: Any, max_length: int = 240) -> str:
+        text = str(value or "")
+        if len(text) <= max_length:
+            return text
+        return f"{text[:max_length]}... (truncated)"
+
+    def _mask_debug_token(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if len(text) <= 16:
+            return "***"
+        return f"{text[:8]}...{text[-6:]}"
+
+    def _summarize_debug_payload(self, data: Any, depth: int = 0) -> Any:
+        if depth > 4:
+            return self._truncate_debug_text(data, max_length=120)
+        if isinstance(data, dict):
+            result: Dict[str, Any] = {}
+            for key, value in data.items():
+                key_lower = str(key).lower()
+                if key_lower in {
+                    "authorization",
+                    "cookie",
+                    "token",
+                    "recaptchatoken",
+                    "grecaptcharesponse",
+                    "clientkey",
+                    "apikey",
+                    "api_key",
+                    "access_token",
+                    "st_token",
+                    "at_token",
+                }:
+                    result[key] = self._mask_debug_token(value)
+                    continue
+                if key_lower in {
+                    "imagebytes",
+                    "rawimagebytes",
+                    "encodedimage",
+                    "base64",
+                    "data",
+                } and isinstance(value, str):
+                    result[key] = f"<{key} length={len(value)}>"
+                    continue
+                result[key] = self._summarize_debug_payload(value, depth + 1)
+            return result
+        if isinstance(data, list):
+            if len(data) > 8:
+                preview = [self._summarize_debug_payload(item, depth + 1) for item in data[:8]]
+                preview.append(f"... ({len(data)} items total)")
+                return preview
+            return [self._summarize_debug_payload(item, depth + 1) for item in data]
+        if isinstance(data, str):
+            return self._truncate_debug_text(data, max_length=240)
+        return data
+
+    def _format_debug_json(self, data: Any) -> str:
+        summarized = self._summarize_debug_payload(data)
+        try:
+            return json.dumps(summarized, ensure_ascii=False, indent=2)
+        except Exception:
+            return self._truncate_debug_text(summarized, max_length=500)
+
+    def _format_debug_timestamp(self) -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    async def _emit_debug_event(
+        self,
+        response_state: Optional[Dict[str, Any]],
+        stream: bool,
+        event: str,
+        title: str,
+        payload: Any = None,
+    ) -> Optional[str]:
+        if not isinstance(response_state, dict) or not response_state.get("debug_enabled"):
+            return None
+
+        lines = [f"[{self._format_debug_timestamp()}] [DEBUG] {title}"]
+        if payload is not None:
+            lines.append(self._format_debug_json(payload))
+        text = "\n".join(lines) + "\n"
+
+        if stream:
+            return self._create_stream_chunk(text)
+        return text
+
+    async def _emit_debug_progress(
+        self,
+        response_state: Optional[Dict[str, Any]],
+        stream: bool,
+        request_log_state: Optional[Dict[str, Any]],
+        token_id: Optional[int],
+        event: str,
+        title: str,
+        payload: Any = None,
+        progress: Optional[int] = None,
+    ) -> Optional[str]:
+        if progress is not None:
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token_id,
+                status_text=f"debug_{event}",
+                progress=progress,
+                response_extra={"debug": self._summarize_debug_payload(payload) if payload is not None else {"event": event}},
+            )
+        return await self._emit_debug_event(
+            response_state=response_state,
+            stream=stream,
+            event=event,
+            title=title,
+            payload=payload,
+        )
 
     def _is_video_url_candidate(self, value: Any) -> bool:
         return isinstance(value, str) and (
@@ -1429,6 +1546,7 @@ class GenerationHandler:
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
         batch_prompts: Optional[List[str]] = None,
+        debug_options: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1451,7 +1569,44 @@ class GenerationHandler:
         generation_result = self._create_generation_result()
         response_state = self._create_response_state()
         response_state["base_url"] = (base_url_override or "").strip().rstrip("/") or None
+        debug_enabled = bool(isinstance(debug_options, dict) and debug_options.get("enabled"))
+        response_state["debug_enabled"] = debug_enabled
+        if isinstance(debug_options, dict) and "includeMediaCheck" in debug_options:
+            response_state["debug_include_media_check"] = bool(debug_options.get("includeMediaCheck"))
         request_log_state: Dict[str, Any] = {"id": None, "progress": 0}
+
+        async def _flow_debug_hook(event: str, payload: Dict[str, Any]):
+            title_map = {
+                "image_upload_prepare": "上传图片准备",
+                "image_upload_request": "上传图片请求",
+                "image_upload_response": "上传图片响应",
+                "image_upload_error": "上传图片失败",
+                "image_upload_fallback": "上传图片接口回退",
+                "captcha_start": "开始打码",
+                "captcha_result": "打码结果",
+                "captcha_error": "打码失败",
+                "image_submit_request": "提交生图请求",
+                "image_submit_response": "生图请求响应",
+                "image_submit_error": "生图请求失败",
+                "image_media_check_request": "查询图片媒体状态",
+                "image_media_check_response": "图片媒体状态响应",
+                "image_media_check_error": "图片媒体状态查询失败",
+            }
+            chunk = await self._emit_debug_progress(
+                response_state=response_state,
+                stream=stream,
+                request_log_state=request_log_state,
+                token_id=token.id if token else None,
+                event=event,
+                title=title_map.get(event, event),
+                payload=payload,
+            )
+            if chunk:
+                yield_queue.append(chunk)
+
+        yield_queue: List[str] = []
+        if hasattr(self.flow_client, "set_debug_hook"):
+            self.flow_client.set_debug_hook(_flow_debug_hook if debug_enabled else None)
 
         # 防止并发链路复用到上一次请求的指纹上下文
         if hasattr(self.flow_client, "clear_request_fingerprint"):
@@ -1507,6 +1662,8 @@ class GenerationHandler:
                 f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
                 role="assistant"
             )
+            while yield_queue:
+                yield yield_queue.pop(0)
             request_log_state["id"] = await self._log_request(
                 token_id=None,
                 operation=request_operation,
@@ -1583,6 +1740,8 @@ class GenerationHandler:
             debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
             if stream:
                 yield self._create_stream_chunk("初始化生成环境...\n")
+                while yield_queue:
+                    yield yield_queue.pop(0)
 
             await self._update_request_log_progress(
                 request_log_state,
@@ -1647,6 +1806,8 @@ class GenerationHandler:
                         pending_token_state=pending_token_state,
                     ):
                         yield chunk
+                        while yield_queue:
+                            yield yield_queue.pop(0)
                 else:
                     async for chunk in self._handle_image_generation(
                         token, project_id, model_config, prompt, images, stream,
@@ -1657,6 +1818,8 @@ class GenerationHandler:
                         pending_token_state=pending_token_state
                     ):
                         yield chunk
+                        while yield_queue:
+                            yield yield_queue.pop(0)
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
                 async for chunk in self._handle_video_generation(
@@ -1669,7 +1832,11 @@ class GenerationHandler:
                     video_media_id=video_media_id,
                 ):
                     yield chunk
+                    while yield_queue:
+                        yield yield_queue.pop(0)
             perf_trace["generation_pipeline_ms"] = int((time.time() - generation_pipeline_started_at) * 1000)
+            while yield_queue:
+                yield yield_queue.pop(0)
 
             # 6. 记录使用
             if not generation_result.get("success"):
@@ -1697,6 +1864,8 @@ class GenerationHandler:
                     status_text="failed",
                     progress=request_log_state.get("progress", 0),
                 )
+                while yield_queue:
+                    yield yield_queue.pop(0)
                 if not generation_result.get("error_emitted"):
                     if stream:
                         yield self._create_stream_chunk(f"❌ {error_msg}\n")
@@ -1782,6 +1951,8 @@ class GenerationHandler:
                 status_text="failed",
                 progress=request_log_state.get("progress", 0),
             )
+            while yield_queue:
+                yield yield_queue.pop(0)
             raise
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
@@ -1807,10 +1978,14 @@ class GenerationHandler:
                 status_text="failed",
                 progress=request_log_state.get("progress", 0),
             )
+            while yield_queue:
+                yield yield_queue.pop(0)
             if stream:
                 yield self._create_stream_chunk(f"❌ {error_msg}\n")
             yield self._create_error_response(error_msg, status_code=500)
         finally:
+            if hasattr(self.flow_client, "set_debug_hook"):
+                self.flow_client.set_debug_hook(None)
             if pending_token_state.get("active") and token and self.load_balancer:
                 await self.load_balancer.release_pending(
                     token.id,
@@ -2151,6 +2326,20 @@ class GenerationHandler:
                 "type": "image",
                 "origin_image_url": image_url
             }
+
+            if response_state.get("debug_enabled") and response_state.get("debug_include_media_check") and media_id:
+                try:
+                    media_result = await self.flow_client.get_media(token.at, media_id)
+                    refreshed_url = (
+                        media_result.get("image", {})
+                        .get("generatedImage", {})
+                        .get("fifeUrl")
+                    )
+                    if refreshed_url:
+                        image_url = refreshed_url
+                        response_state["generated_assets"]["origin_image_url"] = image_url
+                except Exception as exc:
+                    debug_logger.log_warning(f"[IMAGE DEBUG] get_media failed: {exc}")
 
             # 检查是否需要 upsample
             upsample_resolution = model_config.get("upsample")

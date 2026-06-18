@@ -171,6 +171,43 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
 const STATE = { selectedModel: null, modelConfig: null, images: [], generating: false };
 </script>
 <script>
+function truncateText(text, max = 240) {
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function summarizeRequestBody(body) {
+  const cloned = JSON.parse(JSON.stringify(body));
+  const messages = Array.isArray(cloned.messages) ? cloned.messages : [];
+  cloned.messages = messages.map(msg => {
+    if (Array.isArray(msg.content)) {
+      return {
+        ...msg,
+        content: msg.content.map(item => {
+          if (item && item.type === "image_url" && item.image_url && typeof item.image_url.url === "string") {
+            return {
+              ...item,
+              image_url: {
+                ...item.image_url,
+                url: `<data-url length=${item.image_url.url.length}>`
+              }
+            };
+          }
+          if (item && item.type === "text" && typeof item.text === "string") {
+            return { ...item, text: truncateText(item.text, 200) };
+          }
+          return item;
+        })
+      };
+    }
+    if (typeof msg.content === "string") {
+      return { ...msg, content: truncateText(msg.content, 200) };
+    }
+    return msg;
+  });
+  return cloned;
+}
+
 // Model categories for sidebar
 const MODEL_CATEGORIES = {
   "Gemini 3.1 Flash 图片": { filter: m => m.startsWith("gemini-3.1-flash-image") },
@@ -475,10 +512,13 @@ async function generate() {
   const messages = [{ role: "user", content: content.length === 1 ? prompt : content }];
 
   const body = { model: STATE.selectedModel, messages, stream: true };
+  body.flowDebug = { enabled: true, includeMediaCheck: true };
 
   const startTime = Date.now();
   appendLog(`[${new Date().toLocaleTimeString()}] 模型: ${STATE.selectedModel}\n`);
   appendLog(`[${new Date().toLocaleTimeString()}] 提示词: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}\n`);
+  appendLog(`[${new Date().toLocaleTimeString()}] 上传图片数: ${STATE.images.length}\n`);
+  appendLog(`[${new Date().toLocaleTimeString()}] 请求体摘要:\n${JSON.stringify(summarizeRequestBody(body), null, 2)}\n`);
   appendLog(`[${new Date().toLocaleTimeString()}] 开始请求...\n`);
 
   try {
@@ -525,6 +565,9 @@ async function generate() {
               fullContent += content;
               appendLog(content);
             }
+          }
+          if (parsed.url) {
+            appendLog(`\n[${new Date().toLocaleTimeString()}] 返回 URL: ${parsed.url}\n`);
           }
         } catch (e) {
           // skip unparseable chunks

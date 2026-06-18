@@ -81,6 +81,7 @@ class NormalizedGenerationRequest:
     batch_prompts: Optional[List[str]] = None
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
+    debug_options: Optional[Dict[str, Any]] = None
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -424,6 +425,12 @@ def _get_request_base_url(request: Request) -> Optional[str]:
 async def _normalize_openai_request(
     request: ChatCompletionRequest,
 ) -> NormalizedGenerationRequest:
+    debug_options = None
+    if isinstance(getattr(request, "model_extra", None), dict):
+        debug_options = request.model_extra.get("flowDebug")
+    if debug_options is None:
+        debug_options = getattr(request, "flowDebug", None)
+
     if request.messages:
         prompt, images, video_media_id = await _extract_prompt_and_images_from_openai_messages(
             request.messages
@@ -438,6 +445,7 @@ async def _normalize_openai_request(
             images=images,
             messages=request.messages,
             video_media_id=video_media_id,
+            debug_options=debug_options,
         )
 
     if request.contents:
@@ -457,6 +465,11 @@ async def _normalize_gemini_request(
     request: GeminiGenerateContentRequest,
 ) -> NormalizedGenerationRequest:
     resolved_model = _resolve_request_model(model, request)
+    debug_options = None
+    if isinstance(getattr(request, "model_extra", None), dict):
+        debug_options = request.model_extra.get("flowDebug")
+    if debug_options is None:
+        debug_options = getattr(request, "flowDebug", None)
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
     batch_prompts: Optional[List[str]] = None
     if request.batchPrompts is not None:
@@ -508,6 +521,7 @@ async def _normalize_gemini_request(
         prompt=prompt,
         images=images,
         batch_prompts=batch_prompts,
+        debug_options=debug_options,
     )
 
 
@@ -518,6 +532,7 @@ async def _collect_non_stream_result(
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
     batch_prompts: Optional[List[str]] = None,
+    debug_options: Optional[Dict[str, Any]] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -529,6 +544,7 @@ async def _collect_non_stream_result(
         base_url_override=base_url_override,
         video_media_id=video_media_id,
         batch_prompts=batch_prompts,
+        debug_options=debug_options,
     ):
         result = chunk
 
@@ -819,6 +835,7 @@ async def _iterate_openai_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         batch_prompts=normalized.batch_prompts,
+        debug_options=normalized.debug_options,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -844,6 +861,7 @@ async def _iterate_gemini_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         batch_prompts=normalized.batch_prompts,
+        debug_options=normalized.debug_options,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -973,6 +991,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                debug_options=normalized.debug_options,
             )
         )
         return _build_openai_json_response(payload)
@@ -1008,6 +1027,7 @@ async def generate_content(
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
                     batch_prompts=normalized.batch_prompts,
+                    debug_options=normalized.debug_options,
                 )
             )
         )
