@@ -324,6 +324,8 @@ class TokenManager:
         当用户编辑保存token时，如果token未过期，自动清空429禁用状态
         """
         update_fields = {}
+        normalized_project_id = str(project_id or "").strip() if project_id is not None else None
+        normalized_project_name = str(project_name or "").strip() if project_name is not None else None
 
         if st is not None:
             update_fields["st"] = st
@@ -332,9 +334,9 @@ class TokenManager:
         if at_expires is not None:
             update_fields["at_expires"] = at_expires
         if project_id is not None:
-            update_fields["current_project_id"] = project_id
+            update_fields["current_project_id"] = normalized_project_id or None
         if project_name is not None:
-            update_fields["current_project_name"] = project_name
+            update_fields["current_project_name"] = normalized_project_name or None
         if remark is not None:
             update_fields["remark"] = remark
         if image_enabled is not None:
@@ -371,6 +373,32 @@ class TokenManager:
 
         if update_fields:
             await self.db.update_token(token_id, **update_fields)
+
+        # 当项目池只有 1 个时，手动修改 project_id 应同步替换 projects 表，
+        # 否则下次 ensure_project_exists 会从旧项目记录中把 current_project_id 覆盖回去。
+        if (
+            project_id is not None
+            and normalized_project_id
+            and self._get_project_pool_size() == 1
+        ):
+            token_after_update = await self.db.get_token(token_id)
+            resolved_project_name = normalized_project_name
+            if not resolved_project_name:
+                resolved_project_name = str(
+                    getattr(token_after_update, "current_project_name", "") or ""
+                ).strip() or self._build_project_name(1)
+            await self.db.replace_projects_for_token(
+                token_id,
+                [
+                    Project(
+                        project_id=normalized_project_id,
+                        token_id=token_id,
+                        project_name=resolved_project_name,
+                        tool_name="PINHOLE",
+                        is_active=True,
+                    )
+                ],
+            )
 
     # ========== AT自动刷新逻辑 (核心) ==========
 
@@ -623,6 +651,24 @@ class TokenManager:
 
             try:
                 project_pool_size = self._get_project_pool_size()
+                if project_pool_size == 1 and token.current_project_id:
+                    normalized_current_project = str(token.current_project_id or "").strip()
+                    if (
+                        len(projects) != 1
+                        or not projects
+                        or str(projects[0].project_id or "").strip() != normalized_current_project
+                    ):
+                        resolved_project_name = str(token.current_project_name or "").strip() or self._build_project_name(1)
+                        replacement_project = Project(
+                            project_id=normalized_current_project,
+                            token_id=token_id,
+                            project_name=resolved_project_name,
+                            tool_name="PINHOLE",
+                            is_active=True,
+                        )
+                        await self.db.replace_projects_for_token(token_id, [replacement_project])
+                        projects = [replacement_project]
+
                 while len(projects) < project_pool_size:
                     new_project = await self._create_project_for_token(token, len(projects) + 1)
                     projects.append(new_project)
