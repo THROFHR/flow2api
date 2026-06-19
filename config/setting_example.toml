@@ -13,6 +13,7 @@ image_timeout_retry_count = 0
 image_timeout_retry_delay = 0.8
 image_timeout_use_media_proxy_fallback = true
 image_prefer_media_proxy = false
+default_merge_captcha = true
 image_slot_wait_timeout = 480
 image_launch_soft_limit = 20
 image_launch_wait_timeout = 480

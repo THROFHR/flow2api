@@ -91,6 +91,11 @@ class Config:
         except Exception:
             return 3
 
+    @property
+    def default_merge_captcha(self) -> bool:
+        """批量图片生成默认是否合并为单次打码。"""
+        return bool(self._config.get("flow", {}).get("default_merge_captcha", True))
+
     def set_flow_max_retries(self, retries: int):
         """Set flow max retries"""
         if "flow" not in self._config:

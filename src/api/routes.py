@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.config import config
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -79,6 +80,7 @@ class NormalizedGenerationRequest:
     prompt: str
     images: List[bytes]
     batch_prompts: Optional[List[str]] = None
+    merge_captcha: bool = False
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
     debug_options: Optional[Dict[str, Any]] = None
@@ -430,6 +432,13 @@ async def _normalize_openai_request(
         debug_options = request.model_extra.get("flowDebug")
     if debug_options is None:
         debug_options = getattr(request, "flowDebug", None)
+    merge_captcha = bool(config.default_merge_captcha)
+    if isinstance(getattr(request, "model_extra", None), dict):
+        model_extra = request.model_extra
+        if "mergeCAPTCHA" in model_extra:
+            merge_captcha = bool(model_extra.get("mergeCAPTCHA"))
+    elif getattr(request, "mergeCAPTCHA", None) is not None:
+        merge_captcha = bool(getattr(request, "mergeCAPTCHA", False))
 
     if request.messages:
         prompt, images, video_media_id = await _extract_prompt_and_images_from_openai_messages(
@@ -443,6 +452,7 @@ async def _normalize_openai_request(
             model=model,
             prompt=prompt,
             images=images,
+            merge_captcha=merge_captcha,
             messages=request.messages,
             video_media_id=video_media_id,
             debug_options=debug_options,
@@ -470,6 +480,13 @@ async def _normalize_gemini_request(
         debug_options = request.model_extra.get("flowDebug")
     if debug_options is None:
         debug_options = getattr(request, "flowDebug", None)
+    merge_captcha = bool(config.default_merge_captcha)
+    if isinstance(getattr(request, "model_extra", None), dict):
+        model_extra = request.model_extra
+        if "mergeCAPTCHA" in model_extra:
+            merge_captcha = bool(model_extra.get("mergeCAPTCHA"))
+    if getattr(request, "mergeCAPTCHA", None) is not None:
+        merge_captcha = bool(getattr(request, "mergeCAPTCHA"))
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
     batch_prompts: Optional[List[str]] = None
     if request.batchPrompts is not None:
@@ -521,6 +538,7 @@ async def _normalize_gemini_request(
         prompt=prompt,
         images=images,
         batch_prompts=batch_prompts,
+        merge_captcha=merge_captcha,
         debug_options=debug_options,
     )
 
@@ -532,6 +550,7 @@ async def _collect_non_stream_result(
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
     batch_prompts: Optional[List[str]] = None,
+    merge_captcha: bool = False,
     debug_options: Optional[Dict[str, Any]] = None,
 ) -> str:
     handler = _ensure_generation_handler()
@@ -544,6 +563,7 @@ async def _collect_non_stream_result(
         base_url_override=base_url_override,
         video_media_id=video_media_id,
         batch_prompts=batch_prompts,
+        merge_captcha=merge_captcha,
         debug_options=debug_options,
     ):
         result = chunk
@@ -835,6 +855,7 @@ async def _iterate_openai_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         batch_prompts=normalized.batch_prompts,
+        merge_captcha=normalized.merge_captcha,
         debug_options=normalized.debug_options,
     ):
         if chunk.startswith("data: "):
@@ -861,6 +882,7 @@ async def _iterate_gemini_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         batch_prompts=normalized.batch_prompts,
+        merge_captcha=normalized.merge_captcha,
         debug_options=normalized.debug_options,
     ):
         if chunk.startswith("data: "):
@@ -1027,6 +1049,7 @@ async def generate_content(
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
                     batch_prompts=normalized.batch_prompts,
+                    merge_captcha=normalized.merge_captcha,
                     debug_options=normalized.debug_options,
                 )
             )

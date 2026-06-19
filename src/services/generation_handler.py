@@ -1547,6 +1547,7 @@ class GenerationHandler:
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
         batch_prompts: Optional[List[str]] = None,
+        merge_captcha: bool = False,
         debug_options: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator:
         """统一生成入口
@@ -1640,6 +1641,7 @@ class GenerationHandler:
         }
         if batch_prompts:
             request_payload["batch_prompt_count"] = len(batch_prompts)
+            request_payload["merge_captcha"] = bool(merge_captcha)
         debug_logger.log_info(
             f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, "
             f"Prompt: {prompt_log_source[:50]}..."
@@ -1829,6 +1831,7 @@ class GenerationHandler:
                 if batch_prompts:
                     async for chunk in self._handle_batch_image_generation(
                         token, project_id, model_config, batch_prompts, images, stream,
+                        merge_captcha=merge_captcha,
                         perf_trace=perf_trace,
                         generation_result=generation_result,
                         response_state=response_state,
@@ -2050,6 +2053,7 @@ class GenerationHandler:
         prompts: List[str],
         images: Optional[List[bytes]],
         stream: bool,
+        merge_captcha: bool = False,
         perf_trace: Optional[Dict[str, Any]] = None,
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
@@ -2135,6 +2139,123 @@ class GenerationHandler:
                     }
                     for idx, prompt_text in enumerate(prompts)
                 ]
+            elif merge_captcha:
+                generate_started_at = time.time()
+                try:
+                    result, _generation_session_id, upstream_trace = await self.flow_client.generate_images_batch(
+                        at=token.at,
+                        project_id=project_id,
+                        prompts=prompts,
+                        model_name=model_config["model_name"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        image_inputs=image_inputs,
+                        token_id=token.id,
+                        token_image_concurrency=token.image_concurrency,
+                    )
+                    if image_trace is not None:
+                        image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
+                        image_trace["upstream_trace"] = upstream_trace
+
+                    media_entries = result.get("media", [])
+                    if isinstance(media_entries, dict):
+                        media_entries = [media_entries]
+                    workflow_entries = result.get("workflows", [])
+                    if not isinstance(media_entries, list):
+                        media_entries = []
+                    if not isinstance(workflow_entries, list):
+                        workflow_entries = []
+
+                    batch_items = []
+                    batch_assets = []
+                    item_traces = []
+                    for idx, prompt_text in enumerate(prompts):
+                        item_trace: Dict[str, Any] = {
+                            "index": idx,
+                            "prompt": prompt_text,
+                            "status": "failed",
+                        }
+                        generated_asset: Dict[str, Any] = {
+                            "type": "image",
+                            "prompt": prompt_text,
+                            "status": "failed",
+                        }
+                        media_entry = media_entries[idx] if idx < len(media_entries) else None
+                        if not isinstance(media_entry, dict):
+                            error_message = "生成结果为空"
+                            item_trace["error"] = error_message
+                            generated_asset["error"] = error_message
+                            batch_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
+                            batch_assets.append(generated_asset)
+                            item_traces.append(item_trace)
+                            continue
+
+                        try:
+                            image_url, media_id = self._extract_generated_image_media(media_entry)
+                        except Exception as exc:
+                            error_message = self._normalize_error_message(exc, max_length=240)
+                            item_trace["error"] = error_message
+                            generated_asset["error"] = error_message
+                            batch_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
+                            batch_assets.append(generated_asset)
+                            item_traces.append(item_trace)
+                            continue
+
+                        final_url = image_url
+                        cache_started_at = time.time()
+                        if config.cache_enabled:
+                            try:
+                                cached_filename = await self.file_cache.download_and_cache(image_url, "image")
+                                final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                            except Exception as exc:
+                                debug_logger.log_error(
+                                    f"[BATCH IMAGE] Failed to cache merged image {idx + 1}: {str(exc)}"
+                                )
+                                final_url = image_url
+                        item_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
+                        item_trace["status"] = "succeeded"
+                        item_trace["origin_image_url"] = image_url
+                        item_trace["media_id"] = media_id
+                        item_trace["final_image_url"] = final_url
+                        item_trace["upstream_trace"] = upstream_trace
+                        generated_asset.update({
+                            "status": "succeeded",
+                            "origin_image_url": image_url,
+                            "final_image_url": final_url,
+                        })
+                        batch_items.append({
+                            "index": idx,
+                            "prompt": prompt_text,
+                            "status": "succeeded",
+                            "url": final_url,
+                            "origin_image_url": image_url,
+                            "media_id": media_id,
+                        })
+                        batch_assets.append(generated_asset)
+                        item_traces.append(item_trace)
+                except Exception as exc:
+                    error_message = self._normalize_error_message(exc, max_length=240)
+                    batch_items = [
+                        self._build_failed_batch_item(idx, prompt_text, error_message)
+                        for idx, prompt_text in enumerate(prompts)
+                    ]
+                    batch_assets = [
+                        {
+                            "type": "image",
+                            "prompt": prompt_text,
+                            "status": "failed",
+                            "error": error_message,
+                        }
+                        for prompt_text in prompts
+                    ]
+                    item_traces = [
+                        {
+                            "index": idx,
+                            "prompt": prompt_text,
+                            "status": "failed",
+                            "error": error_message,
+                        }
+                        for idx, prompt_text in enumerate(prompts)
+                    ]
             else:
                 async def _run_batch_item(prompt_index: int, prompt_text: str):
                     try:

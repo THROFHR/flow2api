@@ -279,6 +279,7 @@ class GeminiGenerateContentRequest(BaseModel):
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
     batchPrompts: Optional[List[str]] = None
+    mergeCAPTCHA: Optional[bool] = None
 
     model_config = ConfigDict(extra="allow")
 
