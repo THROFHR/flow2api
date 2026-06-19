@@ -40,6 +40,8 @@ class FlowClient:
             default=None
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
+        self._remote_browser_semaphore: Optional[asyncio.Semaphore] = None
+        self._remote_browser_semaphore_limit: int = 0
         self._debug_hook_ctx: contextvars.ContextVar[Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]] = contextvars.ContextVar(
             "flow_debug_hook",
             default=None,
@@ -60,6 +62,13 @@ class FlowClient:
         }
         # 发车策略改为“请求到就发”：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
+
+    def _get_remote_browser_semaphore(self) -> asyncio.Semaphore:
+        limit = max(1, min(20, int(getattr(config, "remote_browser_concurrency", 1) or 1)))
+        if self._remote_browser_semaphore is None or self._remote_browser_semaphore_limit != limit:
+            self._remote_browser_semaphore = asyncio.Semaphore(limit)
+            self._remote_browser_semaphore_limit = limit
+        return self._remote_browser_semaphore
 
     def _generate_user_agent(self, account_id: str = None) -> str:
         """基于账号ID生成固定的 User-Agent
@@ -3498,17 +3507,29 @@ class FlowClient:
                     except Exception as e:
                         debug_logger.log_warning(f"[reCAPTCHA RemoteBrowser] 获取请求代理失败: {e}")
                 solve_timeout = self._resolve_remote_browser_solve_timeout(action)
-                payload = await self._call_remote_browser_service(
-                    method="POST",
-                    path="/api/v1/solve",
-                    json_data={
-                        "project_id": project_id,
-                        "action": action,
-                        "token_id": token_id,
-                        "proxy_url": explicit_proxy_url,
-                    },
-                    timeout_override=solve_timeout,
-                )
+                semaphore = self._get_remote_browser_semaphore()
+                queue_started_at = time.time()
+                await semaphore.acquire()
+                remote_queue_ms = int((time.time() - queue_started_at) * 1000)
+                if remote_queue_ms > 0:
+                    debug_logger.log_info(
+                        f"[reCAPTCHA RemoteBrowser] 排队 {remote_queue_ms}ms "
+                        f"(concurrency={self._remote_browser_semaphore_limit})"
+                    )
+                try:
+                    payload = await self._call_remote_browser_service(
+                        method="POST",
+                        path="/api/v1/solve",
+                        json_data={
+                            "project_id": project_id,
+                            "action": action,
+                            "token_id": token_id,
+                            "proxy_url": explicit_proxy_url,
+                        },
+                        timeout_override=solve_timeout,
+                    )
+                finally:
+                    semaphore.release()
                 token = payload.get("token")
                 session_id = payload.get("session_id")
                 fingerprint = payload.get("fingerprint") if isinstance(payload.get("fingerprint"), dict) else None
@@ -3524,6 +3545,8 @@ class FlowClient:
                         "success": True,
                         "browser_id": str(session_id),
                         "token": token,
+                        "queue_ms": remote_queue_ms,
+                        "concurrency": self._remote_browser_semaphore_limit,
                         "response": payload,
                     },
                 )

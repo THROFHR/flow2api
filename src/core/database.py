@@ -228,6 +228,7 @@ class Database:
             remote_browser_base_url = ""
             remote_browser_api_key = ""
             remote_browser_timeout = 60
+            remote_browser_concurrency = 1
             browser_count = 1
             personal_project_pool_size = 4
             personal_max_resident_tabs = 5
@@ -243,6 +244,7 @@ class Database:
                 remote_browser_base_url = captcha_config.get("remote_browser_base_url", "")
                 remote_browser_api_key = captcha_config.get("remote_browser_api_key", "")
                 remote_browser_timeout = captcha_config.get("remote_browser_timeout", 60)
+                remote_browser_concurrency = captcha_config.get("remote_browser_concurrency", 1)
                 browser_count = captcha_config.get("browser_count", 1)
                 personal_project_pool_size = captcha_config.get("personal_project_pool_size", 4)
                 personal_max_resident_tabs = captcha_config.get("personal_max_resident_tabs", 5)
@@ -252,6 +254,10 @@ class Database:
                 remote_browser_timeout = max(5, int(remote_browser_timeout))
             except Exception:
                 remote_browser_timeout = 60
+            try:
+                remote_browser_concurrency = max(1, min(20, int(remote_browser_concurrency)))
+            except Exception:
+                remote_browser_concurrency = 1
             try:
                 browser_count = max(1, int(browser_count))
             except Exception:
@@ -278,11 +284,12 @@ class Database:
                     id, captcha_method, yescaptcha_api_key, yescaptcha_base_url,
                     yescaptcha_task_type,
                     remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
+                    remote_browser_concurrency,
                     browser_count, personal_project_pool_size,
                     personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
                     personal_idle_tab_ttl_seconds
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 captcha_method,
                 yescaptcha_api_key,
@@ -291,6 +298,7 @@ class Database:
                 remote_browser_base_url,
                 remote_browser_api_key,
                 remote_browser_timeout,
+                remote_browser_concurrency,
                 browser_count,
                 personal_project_pool_size,
                 personal_max_resident_tabs,
@@ -385,6 +393,7 @@ class Database:
                         remote_browser_base_url TEXT DEFAULT '',
                         remote_browser_api_key TEXT DEFAULT '',
                         remote_browser_timeout INTEGER DEFAULT 60,
+                        remote_browser_concurrency INTEGER DEFAULT 1,
                         website_key TEXT DEFAULT '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV',
                         page_action TEXT DEFAULT 'IMAGE_GENERATION',
                         browser_proxy_enabled BOOLEAN DEFAULT 0,
@@ -494,6 +503,7 @@ class Database:
                     ("remote_browser_base_url", "TEXT DEFAULT ''"),
                     ("remote_browser_api_key", "TEXT DEFAULT ''"),
                     ("remote_browser_timeout", "INTEGER DEFAULT 60"),
+                    ("remote_browser_concurrency", "INTEGER DEFAULT 1"),
                 ]
 
                 for col_name, col_type in captcha_columns_to_add:
@@ -753,6 +763,7 @@ class Database:
                     remote_browser_base_url TEXT DEFAULT '',
                     remote_browser_api_key TEXT DEFAULT '',
                     remote_browser_timeout INTEGER DEFAULT 60,
+                    remote_browser_concurrency INTEGER DEFAULT 1,
                     website_key TEXT DEFAULT '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV',
                     page_action TEXT DEFAULT 'IMAGE_GENERATION',
 
@@ -1677,6 +1688,7 @@ class Database:
             config.set_remote_browser_base_url(captcha_config.remote_browser_base_url)
             config.set_remote_browser_api_key(captcha_config.remote_browser_api_key)
             config.set_remote_browser_timeout(captcha_config.remote_browser_timeout)
+            config.set_remote_browser_concurrency(captcha_config.remote_browser_concurrency)
             config.set_browser_count(captcha_config.browser_count)
             config.set_personal_project_pool_size(captcha_config.personal_project_pool_size)
             config.set_personal_max_resident_tabs(captcha_config.personal_max_resident_tabs)
@@ -1814,6 +1826,7 @@ class Database:
         remote_browser_base_url: str = None,
         remote_browser_api_key: str = None,
         remote_browser_timeout: int = None,
+        remote_browser_concurrency: int = None,
         browser_proxy_enabled: bool = None,
         browser_proxy_url: str = None,
         browser_count: int = None,
@@ -1845,6 +1858,7 @@ class Database:
                 new_remote_base_url = remote_browser_base_url if remote_browser_base_url is not None else current.get("remote_browser_base_url", "")
                 new_remote_api_key = remote_browser_api_key if remote_browser_api_key is not None else current.get("remote_browser_api_key", "")
                 new_remote_timeout = remote_browser_timeout if remote_browser_timeout is not None else current.get("remote_browser_timeout", 60)
+                new_remote_concurrency = remote_browser_concurrency if remote_browser_concurrency is not None else current.get("remote_browser_concurrency", 1)
                 new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else current.get("browser_proxy_enabled", False)
                 new_proxy_url = browser_proxy_url if browser_proxy_url is not None else current.get("browser_proxy_url")
                 new_browser_count = browser_count if browser_count is not None else current.get("browser_count", 1)
@@ -1857,6 +1871,7 @@ class Database:
                 )
                 new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else current.get("personal_idle_tab_ttl_seconds", 600)
                 new_remote_timeout = max(5, int(new_remote_timeout)) if new_remote_timeout is not None else 60
+                new_remote_concurrency = max(1, min(20, int(new_remote_concurrency)))
                 new_browser_count = max(1, min(20, int(new_browser_count)))
                 new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
                 new_personal_max_tabs = max(1, min(50, int(new_personal_max_tabs)))  # 限制1-50
@@ -1871,6 +1886,7 @@ class Database:
                         ezcaptcha_api_key = ?, ezcaptcha_base_url = ?,
                         capsolver_api_key = ?, capsolver_base_url = ?,
                         remote_browser_base_url = ?, remote_browser_api_key = ?, remote_browser_timeout = ?,
+                        remote_browser_concurrency = ?,
                         browser_proxy_enabled = ?, browser_proxy_url = ?, browser_count = ?,
                         personal_project_pool_size = ?,
                         personal_max_resident_tabs = ?,
@@ -1882,7 +1898,7 @@ class Database:
                       new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
-                      new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
+                      new_remote_concurrency, new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
                       new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl))
             else:
                 new_method = captcha_method if captcha_method is not None else "yescaptcha"
@@ -1898,6 +1914,7 @@ class Database:
                 new_remote_base_url = remote_browser_base_url if remote_browser_base_url is not None else ""
                 new_remote_api_key = remote_browser_api_key if remote_browser_api_key is not None else ""
                 new_remote_timeout = remote_browser_timeout if remote_browser_timeout is not None else 60
+                new_remote_concurrency = remote_browser_concurrency if remote_browser_concurrency is not None else 1
                 new_proxy_enabled = browser_proxy_enabled if browser_proxy_enabled is not None else False
                 new_proxy_url = browser_proxy_url
                 new_browser_count = browser_count if browser_count is not None else 1
@@ -1910,6 +1927,7 @@ class Database:
                 )
                 new_personal_idle_ttl = personal_idle_tab_ttl_seconds if personal_idle_tab_ttl_seconds is not None else 600
                 new_remote_timeout = max(5, int(new_remote_timeout))
+                new_remote_concurrency = max(1, min(20, int(new_remote_concurrency)))
                 new_browser_count = max(1, min(20, int(new_browser_count)))
                 new_personal_project_pool_size = max(1, min(50, int(new_personal_project_pool_size)))
                 new_personal_max_tabs = max(1, min(50, int(new_personal_max_tabs)))
@@ -1922,16 +1940,17 @@ class Database:
                         capmonster_api_key, capmonster_base_url, ezcaptcha_api_key, ezcaptcha_base_url,
                         capsolver_api_key, capsolver_base_url,
                         remote_browser_base_url, remote_browser_api_key, remote_browser_timeout,
+                        remote_browser_concurrency,
                         browser_proxy_enabled, browser_proxy_url, browser_count,
                         personal_project_pool_size,
                         personal_max_resident_tabs, browser_personal_fresh_restart_every_n_solves,
                         personal_idle_tab_ttl_seconds)
-                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (new_method, new_yes_key, new_yes_url, new_yes_task_type,
                       new_cap_key, new_cap_url,
                       new_ez_key, new_ez_url, new_cs_key, new_cs_url,
                       (new_remote_base_url or "").strip(), (new_remote_api_key or "").strip(), new_remote_timeout,
-                      new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
+                      new_remote_concurrency, new_proxy_enabled, new_proxy_url, new_browser_count, new_personal_project_pool_size,
                       new_personal_max_tabs, new_personal_fresh_restart_every, new_personal_idle_ttl))
 
             await db.commit()

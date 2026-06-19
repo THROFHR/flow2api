@@ -191,6 +191,7 @@ class CaptchaConfig(BaseModel):
     remote_browser_base_url: str = ""
     remote_browser_api_key: str = ""
     remote_browser_timeout: int = 60
+    remote_browser_concurrency: int = 1  # flow2api 侧允许同时发起的远程打码数量
     website_key: str = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
     page_action: str = "IMAGE_GENERATION"
     browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理

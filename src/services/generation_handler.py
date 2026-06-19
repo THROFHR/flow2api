@@ -2045,6 +2045,113 @@ class GenerationHandler:
         media_id = media_entry.get("name") if isinstance(media_entry, dict) else None
         return image_url, media_id
 
+    def _align_batch_media_entries(
+        self,
+        media_entries: List[Dict[str, Any]],
+        workflow_entries: List[Dict[str, Any]],
+        prompts: List[str],
+    ) -> List[Optional[Dict[str, Any]]]:
+        """按 workflow.primaryMediaId 对齐批量图片结果，缺少信息时回退到数组顺序。"""
+        expected_count = len(prompts)
+        ordered_entries: List[Optional[Dict[str, Any]]] = [None] * expected_count
+        media_by_id = {
+            str(entry.get("name")): entry
+            for entry in media_entries
+            if isinstance(entry, dict) and entry.get("name")
+        }
+        prompt_indexes_by_text: Dict[str, List[int]] = {}
+        for idx, prompt in enumerate(prompts):
+            prompt_indexes_by_text.setdefault(str(prompt or "").strip(), []).append(idx)
+        mapped_count = 0
+        for workflow_index, workflow in enumerate(workflow_entries[:expected_count]):
+            if not isinstance(workflow, dict):
+                continue
+            metadata = workflow.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            media_id = str(metadata.get("primaryMediaId") or "").strip()
+            media_entry = media_by_id.get(media_id) if media_id else None
+            if not media_entry:
+                continue
+            display_name = str(metadata.get("displayName") or "").strip()
+            candidate_indexes = prompt_indexes_by_text.get(display_name) or []
+            target_index = None
+            while candidate_indexes:
+                candidate_index = candidate_indexes.pop(0)
+                if ordered_entries[candidate_index] is None:
+                    target_index = candidate_index
+                    break
+            if target_index is None and workflow_index < expected_count and ordered_entries[workflow_index] is None:
+                target_index = workflow_index
+            if target_index is not None:
+                ordered_entries[target_index] = media_entry
+                mapped_count += 1
+
+        if mapped_count:
+            return ordered_entries
+
+        for idx in range(expected_count):
+            if idx < len(media_entries) and isinstance(media_entries[idx], dict):
+                ordered_entries[idx] = media_entries[idx]
+        return ordered_entries
+
+    async def _build_merged_batch_success_item(
+        self,
+        *,
+        index: int,
+        prompt: str,
+        media_entry: Dict[str, Any],
+        response_state: Dict[str, Any],
+        upstream_trace: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """把合并批量接口返回的一条 media 结果转换成统一的 batch item。"""
+        item_trace: Dict[str, Any] = {
+            "index": index,
+            "prompt": prompt,
+            "status": "succeeded",
+        }
+        generated_asset: Dict[str, Any] = {
+            "type": "image",
+            "prompt": prompt,
+            "status": "succeeded",
+        }
+
+        image_url, media_id = self._extract_generated_image_media(media_entry)
+        final_url = image_url
+        cache_started_at = time.time()
+        if config.cache_enabled:
+            try:
+                cached_filename = await self.file_cache.download_and_cache(image_url, "image")
+                final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+            except Exception as exc:
+                debug_logger.log_error(
+                    f"[BATCH IMAGE] Failed to cache merged image {index + 1}: {str(exc)}"
+                )
+                final_url = image_url
+
+        item_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
+        item_trace["origin_image_url"] = image_url
+        item_trace["media_id"] = media_id
+        item_trace["final_image_url"] = final_url
+        if upstream_trace is not None:
+            item_trace["upstream_trace"] = upstream_trace
+        generated_asset.update({
+            "origin_image_url": image_url,
+            "final_image_url": final_url,
+        })
+        return (
+            {
+                "index": index,
+                "prompt": prompt,
+                "status": "succeeded",
+                "url": final_url,
+                "origin_image_url": image_url,
+                "media_id": media_id,
+            },
+            generated_asset,
+            item_trace,
+        )
+
     async def _handle_batch_image_generation(
         self,
         token,
@@ -2164,6 +2271,11 @@ class GenerationHandler:
                         media_entries = []
                     if not isinstance(workflow_entries, list):
                         workflow_entries = []
+                    aligned_media_entries = self._align_batch_media_entries(
+                        media_entries,
+                        workflow_entries,
+                        prompts,
+                    )
 
                     batch_items = []
                     batch_assets = []
@@ -2179,7 +2291,7 @@ class GenerationHandler:
                             "prompt": prompt_text,
                             "status": "failed",
                         }
-                        media_entry = media_entries[idx] if idx < len(media_entries) else None
+                        media_entry = aligned_media_entries[idx] if idx < len(aligned_media_entries) else None
                         if not isinstance(media_entry, dict):
                             error_message = "生成结果为空"
                             item_trace["error"] = error_message
@@ -2190,7 +2302,13 @@ class GenerationHandler:
                             continue
 
                         try:
-                            image_url, media_id = self._extract_generated_image_media(media_entry)
+                            item_result, generated_asset, item_trace = await self._build_merged_batch_success_item(
+                                index=idx,
+                                prompt=prompt_text,
+                                media_entry=media_entry,
+                                response_state=response_state,
+                                upstream_trace=upstream_trace,
+                            )
                         except Exception as exc:
                             error_message = self._normalize_error_message(exc, max_length=240)
                             item_trace["error"] = error_message
@@ -2200,38 +2318,53 @@ class GenerationHandler:
                             item_traces.append(item_trace)
                             continue
 
-                        final_url = image_url
-                        cache_started_at = time.time()
-                        if config.cache_enabled:
-                            try:
-                                cached_filename = await self.file_cache.download_and_cache(image_url, "image")
-                                final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
-                            except Exception as exc:
-                                debug_logger.log_error(
-                                    f"[BATCH IMAGE] Failed to cache merged image {idx + 1}: {str(exc)}"
-                                )
-                                final_url = image_url
-                        item_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
-                        item_trace["status"] = "succeeded"
-                        item_trace["origin_image_url"] = image_url
-                        item_trace["media_id"] = media_id
-                        item_trace["final_image_url"] = final_url
-                        item_trace["upstream_trace"] = upstream_trace
-                        generated_asset.update({
-                            "status": "succeeded",
-                            "origin_image_url": image_url,
-                            "final_image_url": final_url,
-                        })
-                        batch_items.append({
-                            "index": idx,
-                            "prompt": prompt_text,
-                            "status": "succeeded",
-                            "url": final_url,
-                            "origin_image_url": image_url,
-                            "media_id": media_id,
-                        })
+                        batch_items.append(item_result)
                         batch_assets.append(generated_asset)
                         item_traces.append(item_trace)
+
+                    failed_indexes = [
+                        idx
+                        for idx, item in enumerate(batch_items)
+                        if item.get("status") != "succeeded" or not item.get("url")
+                    ]
+                    if failed_indexes:
+                        retry_started_at = time.time()
+                        retry_results: List[Dict[str, Any]] = []
+                        debug_logger.log_info(
+                            f"[BATCH IMAGE] 合并打码批量结果有 {len(failed_indexes)} 个失败项，开始逐项补偿重试"
+                        )
+                        for retry_index in failed_indexes:
+                            retry_prompt = prompts[retry_index]
+                            await self._update_request_log_progress(
+                                request_log_state,
+                                token_id=token.id,
+                                status_text=f"batch_item_{retry_index + 1}_retrying",
+                                progress=92,
+                            )
+                            item_result, generated_asset, item_trace = await self._process_single_batch_image_item(
+                                token=token,
+                                project_id=project_id,
+                                model_config=model_config,
+                                prompt=retry_prompt,
+                                prompt_index=retry_index,
+                                total_prompts=len(prompts),
+                                image_inputs=image_inputs,
+                                response_state=response_state,
+                                request_log_state=request_log_state,
+                                normalized_tier=normalized_tier,
+                            )
+                            item_trace["merged_batch_retry"] = True
+                            batch_items[retry_index] = item_result
+                            batch_assets[retry_index] = generated_asset
+                            item_traces[retry_index] = item_trace
+                            retry_results.append({
+                                "index": retry_index,
+                                "status": item_result.get("status"),
+                                "error": item_result.get("error"),
+                            })
+                        if image_trace is not None:
+                            image_trace["merged_retry_ms"] = int((time.time() - retry_started_at) * 1000)
+                            image_trace["merged_retry_results"] = retry_results
                 except Exception as exc:
                     error_message = self._normalize_error_message(exc, max_length=240)
                     batch_items = [

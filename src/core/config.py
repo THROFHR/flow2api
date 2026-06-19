@@ -647,6 +647,25 @@ class Config:
             normalized = 60
         self._config["captcha"]["remote_browser_timeout"] = normalized
 
+    @property
+    def remote_browser_concurrency(self) -> int:
+        """flow2api 侧允许同时发起的远程打码数量。"""
+        value = self._config.get("captcha", {}).get("remote_browser_concurrency", 1)
+        try:
+            return max(1, min(20, int(value)))
+        except Exception:
+            return 1
+
+    def set_remote_browser_concurrency(self, value: int):
+        """设置 flow2api 侧远程打码并发上限。"""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        try:
+            normalized = max(1, min(20, int(value)))
+        except Exception:
+            normalized = 1
+        self._config["captcha"]["remote_browser_concurrency"] = normalized
+
 
 # Global config instance
 config = Config()

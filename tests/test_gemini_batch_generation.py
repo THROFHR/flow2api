@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 
 from src.api import routes
 from src.core.models import GeminiContent, GeminiGenerateContentRequest, GeminiPart
+from src.services.generation_handler import GenerationHandler
 from src.services.flow_client import FlowClient
 
 
@@ -157,6 +158,104 @@ class FlowClientBatchImageTests(unittest.IsolatedAsyncioTestCase):
             captured["json_data"]["requests"][1]["imageInputs"],
             [{"name": "ref-1", "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}],
         )
+
+
+class GenerationHandlerMergedCaptchaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_merged_batch_retries_missing_item_individually(self):
+        token = type(
+            "Token",
+            (),
+            {
+                "id": 1,
+                "at": "at-token",
+                "user_paygate_tier": "PAYGATE_TIER_PAID",
+                "image_concurrency": -1,
+            },
+        )()
+        flow_client = type("FlowClientStub", (), {})()
+        flow_client.upload_image = AsyncMock()
+        flow_client.generate_images_batch = AsyncMock(
+            return_value=(
+                {
+                    "media": [
+                        {
+                            "name": "media-2",
+                            "image": {
+                                "generatedImage": {
+                                    "fifeUrl": "https://example.com/2.png",
+                                }
+                            },
+                        }
+                    ],
+                    "workflows": [
+                        {"metadata": {"displayName": "prompt-2", "primaryMediaId": "media-2"}},
+                    ],
+                },
+                "session-1",
+                {"generation_attempts": [{"attempt": 1, "success": True}]},
+            )
+        )
+
+        handler = GenerationHandler(
+            flow_client=flow_client,
+            token_manager=None,
+            load_balancer=None,
+            db=None,
+            concurrency_manager=None,
+            proxy_manager=None,
+        )
+        handler._process_single_batch_image_item = AsyncMock(
+            return_value=(
+                {
+                    "index": 0,
+                    "prompt": "prompt-1",
+                    "status": "succeeded",
+                    "url": "https://example.com/retry-1.png",
+                    "origin_image_url": "https://example.com/retry-1.png",
+                    "media_id": "media-retry-1",
+                },
+                {
+                    "type": "image",
+                    "prompt": "prompt-1",
+                    "status": "succeeded",
+                    "origin_image_url": "https://example.com/retry-1.png",
+                    "final_image_url": "https://example.com/retry-1.png",
+                },
+                {
+                    "index": 0,
+                    "prompt": "prompt-1",
+                    "status": "succeeded",
+                    "final_image_url": "https://example.com/retry-1.png",
+                },
+            )
+        )
+
+        chunks = [
+            chunk
+            async for chunk in handler._handle_batch_image_generation(
+                token=token,
+                project_id="project-1",
+                model_config={
+                    "model_name": "GEM_PIX",
+                    "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
+                },
+                prompts=["prompt-1", "prompt-2"],
+                images=None,
+                stream=False,
+                merge_captcha=True,
+                perf_trace={},
+                generation_result=handler._create_generation_result(),
+                response_state=handler._create_response_state(),
+                request_log_state=None,
+            )
+        ]
+
+        self.assertEqual(len(chunks), 1)
+        flow_client.generate_images_batch.assert_awaited_once()
+        handler._process_single_batch_image_item.assert_awaited_once()
+        retry_kwargs = handler._process_single_batch_image_item.await_args.kwargs
+        self.assertEqual(retry_kwargs["prompt_index"], 0)
+        self.assertEqual(retry_kwargs["prompt"], "prompt-1")
 
 
 if __name__ == "__main__":

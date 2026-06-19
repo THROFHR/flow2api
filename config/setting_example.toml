@@ -68,5 +68,6 @@ yescaptcha_task_type = "RecaptchaV3TaskProxylessM1"  # 可选: RecaptchaV3TaskPr
 remote_browser_base_url = ""  # 远程有头打码服务地址
 remote_browser_api_key = ""   # 远程有头打码服务 API Key
 remote_browser_timeout = 60   # 远程有头打码请求超时(秒)
+remote_browser_concurrency = 1  # flow2api 侧同时发起远程打码数量，超过会排队
 capsolver_api_key = ""
 capsolver_base_url = "https://api.capsolver.com"

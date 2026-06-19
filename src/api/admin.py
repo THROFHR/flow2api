@@ -1591,6 +1591,7 @@ async def update_captcha_config(
     remote_browser_base_url = request.get("remote_browser_base_url")
     remote_browser_api_key = request.get("remote_browser_api_key")
     remote_browser_timeout = request.get("remote_browser_timeout", 60)
+    remote_browser_concurrency = request.get("remote_browser_concurrency", 1)
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
@@ -1618,6 +1619,10 @@ async def update_captcha_config(
         remote_browser_timeout = max(5, int(remote_browser_timeout or 60))
     except Exception:
         return {"success": False, "message": "远程打码超时时间必须是整数秒"}
+    try:
+        remote_browser_concurrency = max(1, min(20, int(remote_browser_concurrency or 1)))
+    except Exception:
+        return {"success": False, "message": "远程打码并发数量必须是整数"}
     try:
         browser_count = max(1, min(20, int(browser_count or 1)))
     except Exception:
@@ -1650,6 +1655,7 @@ async def update_captcha_config(
         remote_browser_base_url=remote_browser_base_url,
         remote_browser_api_key=remote_browser_api_key,
         remote_browser_timeout=remote_browser_timeout,
+        remote_browser_concurrency=remote_browser_concurrency,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
         browser_count=browser_count,
@@ -1701,6 +1707,7 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "remote_browser_base_url": captcha_config.remote_browser_base_url,
         "remote_browser_api_key": captcha_config.remote_browser_api_key,
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
+        "remote_browser_concurrency": captcha_config.remote_browser_concurrency,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
         "browser_count": captcha_config.browser_count,
