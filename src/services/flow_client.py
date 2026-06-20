@@ -1425,6 +1425,7 @@ class FlowClient:
         token_id: Optional[int] = None,
         token_image_concurrency: Optional[int] = None,
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
+        max_retries_override: Optional[int] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
         """批量生成图片，共享同一组参考图输入。"""
         normalized_prompts = [str(prompt or "").strip() for prompt in prompts if str(prompt or "").strip()]
@@ -1433,7 +1434,13 @@ class FlowClient:
 
         url = f"{self.api_base_url}/projects/{project_id}/flowMedia:batchGenerateImages"
 
-        max_retries = config.flow_max_retries
+        if max_retries_override is None:
+            max_retries = config.flow_max_retries
+        else:
+            try:
+                max_retries = max(1, int(max_retries_override))
+            except Exception:
+                max_retries = 1
         last_error = None
         perf_trace: Dict[str, Any] = {
             "max_retries": max_retries,

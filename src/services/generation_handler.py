@@ -2247,148 +2247,160 @@ class GenerationHandler:
                     for idx, prompt_text in enumerate(prompts)
                 ]
             elif merge_captcha:
-                generate_started_at = time.time()
-                try:
-                    result, _generation_session_id, upstream_trace = await self.flow_client.generate_images_batch(
-                        at=token.at,
-                        project_id=project_id,
-                        prompts=prompts,
-                        model_name=model_config["model_name"],
-                        aspect_ratio=model_config["aspect_ratio"],
-                        image_inputs=image_inputs,
+                batch_attempts: List[Dict[str, Any]] = []
+                total_generate_ms = 0
+                max_batch_attempts = config.flow_max_retries
+                latest_upstream_trace: Optional[Dict[str, Any]] = None
+
+                for batch_attempt in range(max_batch_attempts):
+                    attempt_started_at = time.time()
+                    await self._update_request_log_progress(
+                        request_log_state,
                         token_id=token.id,
-                        token_image_concurrency=token.image_concurrency,
+                        status_text=f"submitting_batch_images_attempt_{batch_attempt + 1}",
+                        progress=28,
                     )
-                    if image_trace is not None:
-                        image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
-                        image_trace["upstream_trace"] = upstream_trace
-
-                    media_entries = result.get("media", [])
-                    if isinstance(media_entries, dict):
-                        media_entries = [media_entries]
-                    workflow_entries = result.get("workflows", [])
-                    if not isinstance(media_entries, list):
-                        media_entries = []
-                    if not isinstance(workflow_entries, list):
-                        workflow_entries = []
-                    aligned_media_entries = self._align_batch_media_entries(
-                        media_entries,
-                        workflow_entries,
-                        prompts,
-                    )
-
-                    batch_items = []
-                    batch_assets = []
-                    item_traces = []
-                    for idx, prompt_text in enumerate(prompts):
-                        item_trace: Dict[str, Any] = {
-                            "index": idx,
-                            "prompt": prompt_text,
-                            "status": "failed",
-                        }
-                        generated_asset: Dict[str, Any] = {
-                            "type": "image",
-                            "prompt": prompt_text,
-                            "status": "failed",
-                        }
-                        media_entry = aligned_media_entries[idx] if idx < len(aligned_media_entries) else None
-                        if not isinstance(media_entry, dict):
-                            error_message = "生成结果为空"
-                            item_trace["error"] = error_message
-                            generated_asset["error"] = error_message
-                            batch_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
-                            batch_assets.append(generated_asset)
-                            item_traces.append(item_trace)
-                            continue
-
-                        try:
-                            item_result, generated_asset, item_trace = await self._build_merged_batch_success_item(
-                                index=idx,
-                                prompt=prompt_text,
-                                media_entry=media_entry,
-                                response_state=response_state,
-                                upstream_trace=upstream_trace,
-                            )
-                        except Exception as exc:
-                            error_message = self._normalize_error_message(exc, max_length=240)
-                            item_trace["error"] = error_message
-                            generated_asset["error"] = error_message
-                            batch_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
-                            batch_assets.append(generated_asset)
-                            item_traces.append(item_trace)
-                            continue
-
-                        batch_items.append(item_result)
-                        batch_assets.append(generated_asset)
-                        item_traces.append(item_trace)
-
-                    failed_indexes = [
-                        idx
-                        for idx, item in enumerate(batch_items)
-                        if item.get("status") != "succeeded" or not item.get("url")
-                    ]
-                    if failed_indexes:
-                        retry_started_at = time.time()
-                        retry_results: List[Dict[str, Any]] = []
-                        debug_logger.log_info(
-                            f"[BATCH IMAGE] 合并打码批量结果有 {len(failed_indexes)} 个失败项，开始逐项补偿重试"
+                    try:
+                        result, _generation_session_id, upstream_trace = await self.flow_client.generate_images_batch(
+                            at=token.at,
+                            project_id=project_id,
+                            prompts=prompts,
+                            model_name=model_config["model_name"],
+                            aspect_ratio=model_config["aspect_ratio"],
+                            image_inputs=image_inputs,
+                            token_id=token.id,
+                            token_image_concurrency=token.image_concurrency,
+                            max_retries_override=1,
                         )
-                        for retry_index in failed_indexes:
-                            retry_prompt = prompts[retry_index]
-                            await self._update_request_log_progress(
-                                request_log_state,
-                                token_id=token.id,
-                                status_text=f"batch_item_{retry_index + 1}_retrying",
-                                progress=92,
+                        latest_upstream_trace = upstream_trace
+
+                        media_entries = result.get("media", [])
+                        if isinstance(media_entries, dict):
+                            media_entries = [media_entries]
+                        workflow_entries = result.get("workflows", [])
+                        if not isinstance(media_entries, list):
+                            media_entries = []
+                        if not isinstance(workflow_entries, list):
+                            workflow_entries = []
+                        aligned_media_entries = self._align_batch_media_entries(
+                            media_entries,
+                            workflow_entries,
+                            prompts,
+                        )
+
+                        attempt_items: List[Dict[str, Any]] = []
+                        attempt_assets: List[Dict[str, Any]] = []
+                        attempt_traces: List[Dict[str, Any]] = []
+                        for idx, prompt_text in enumerate(prompts):
+                            item_trace: Dict[str, Any] = {
+                                "index": idx,
+                                "prompt": prompt_text,
+                                "status": "failed",
+                            }
+                            generated_asset: Dict[str, Any] = {
+                                "type": "image",
+                                "prompt": prompt_text,
+                                "status": "failed",
+                            }
+                            media_entry = aligned_media_entries[idx] if idx < len(aligned_media_entries) else None
+                            if not isinstance(media_entry, dict):
+                                error_message = "生成结果为空"
+                                item_trace["error"] = error_message
+                                generated_asset["error"] = error_message
+                                attempt_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
+                                attempt_assets.append(generated_asset)
+                                attempt_traces.append(item_trace)
+                                continue
+
+                            try:
+                                item_result, generated_asset, item_trace = await self._build_merged_batch_success_item(
+                                    index=idx,
+                                    prompt=prompt_text,
+                                    media_entry=media_entry,
+                                    response_state=response_state,
+                                    upstream_trace=upstream_trace,
+                                )
+                            except Exception as exc:
+                                error_message = self._normalize_error_message(exc, max_length=240)
+                                item_trace["error"] = error_message
+                                generated_asset["error"] = error_message
+                                attempt_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
+                                attempt_assets.append(generated_asset)
+                                attempt_traces.append(item_trace)
+                                continue
+
+                            attempt_items.append(item_result)
+                            attempt_assets.append(generated_asset)
+                            attempt_traces.append(item_trace)
+
+                        attempt_summary = self._build_batch_summary(attempt_items)
+                        attempt_generate_ms = int((time.time() - attempt_started_at) * 1000)
+                        total_generate_ms += attempt_generate_ms
+                        batch_attempts.append({
+                            "attempt": batch_attempt + 1,
+                            "status": "success" if attempt_summary["succeeded"] else "all_failed",
+                            "summary": attempt_summary,
+                            "duration_ms": attempt_generate_ms,
+                            "upstream_trace": upstream_trace,
+                        })
+                        batch_items = attempt_items
+                        batch_assets = attempt_assets
+                        item_traces = attempt_traces
+
+                        if attempt_summary["succeeded"] > 0:
+                            break
+
+                        if batch_attempt < max_batch_attempts - 1:
+                            debug_logger.log_warning(
+                                f"[BATCH IMAGE] 合并批量第 {batch_attempt + 1}/{max_batch_attempts} 轮全部失败，准备重新整批提交"
                             )
-                            item_result, generated_asset, item_trace = await self._process_single_batch_image_item(
-                                token=token,
-                                project_id=project_id,
-                                model_config=model_config,
-                                prompt=retry_prompt,
-                                prompt_index=retry_index,
-                                total_prompts=len(prompts),
-                                image_inputs=image_inputs,
-                                response_state=response_state,
-                                request_log_state=request_log_state,
-                                normalized_tier=normalized_tier,
+                            await asyncio.sleep(1)
+                    except Exception as exc:
+                        error_message = self._normalize_error_message(exc, max_length=240)
+                        attempt_generate_ms = int((time.time() - attempt_started_at) * 1000)
+                        total_generate_ms += attempt_generate_ms
+                        batch_items = [
+                            self._build_failed_batch_item(idx, prompt_text, error_message)
+                            for idx, prompt_text in enumerate(prompts)
+                        ]
+                        batch_assets = [
+                            {
+                                "type": "image",
+                                "prompt": prompt_text,
+                                "status": "failed",
+                                "error": error_message,
+                            }
+                            for prompt_text in prompts
+                        ]
+                        item_traces = [
+                            {
+                                "index": idx,
+                                "prompt": prompt_text,
+                                "status": "failed",
+                                "error": error_message,
+                            }
+                            for idx, prompt_text in enumerate(prompts)
+                        ]
+                        attempt_summary = self._build_batch_summary(batch_items)
+                        batch_attempts.append({
+                            "attempt": batch_attempt + 1,
+                            "status": "all_failed",
+                            "summary": attempt_summary,
+                            "duration_ms": attempt_generate_ms,
+                            "error": error_message,
+                        })
+                        if batch_attempt < max_batch_attempts - 1:
+                            debug_logger.log_warning(
+                                f"[BATCH IMAGE] 合并批量第 {batch_attempt + 1}/{max_batch_attempts} 轮异常且全部失败，准备重新整批提交: {error_message}"
                             )
-                            item_trace["merged_batch_retry"] = True
-                            batch_items[retry_index] = item_result
-                            batch_assets[retry_index] = generated_asset
-                            item_traces[retry_index] = item_trace
-                            retry_results.append({
-                                "index": retry_index,
-                                "status": item_result.get("status"),
-                                "error": item_result.get("error"),
-                            })
-                        if image_trace is not None:
-                            image_trace["merged_retry_ms"] = int((time.time() - retry_started_at) * 1000)
-                            image_trace["merged_retry_results"] = retry_results
-                except Exception as exc:
-                    error_message = self._normalize_error_message(exc, max_length=240)
-                    batch_items = [
-                        self._build_failed_batch_item(idx, prompt_text, error_message)
-                        for idx, prompt_text in enumerate(prompts)
-                    ]
-                    batch_assets = [
-                        {
-                            "type": "image",
-                            "prompt": prompt_text,
-                            "status": "failed",
-                            "error": error_message,
-                        }
-                        for prompt_text in prompts
-                    ]
-                    item_traces = [
-                        {
-                            "index": idx,
-                            "prompt": prompt_text,
-                            "status": "failed",
-                            "error": error_message,
-                        }
-                        for idx, prompt_text in enumerate(prompts)
-                    ]
+                            await asyncio.sleep(1)
+                            continue
+
+                if image_trace is not None:
+                    image_trace["generate_api_ms"] = total_generate_ms
+                    image_trace["batch_attempts"] = batch_attempts
+                    if latest_upstream_trace is not None:
+                        image_trace["upstream_trace"] = latest_upstream_trace
             else:
                 async def _run_batch_item(prompt_index: int, prompt_text: str):
                     try:

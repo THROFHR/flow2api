@@ -1,7 +1,9 @@
+import json
 import unittest
 from unittest.mock import AsyncMock
 
 from src.api import routes
+from src.core.config import config
 from src.core.models import GeminiContent, GeminiGenerateContentRequest, GeminiPart
 from src.services.generation_handler import GenerationHandler
 from src.services.flow_client import FlowClient
@@ -115,6 +117,7 @@ class FlowClientBatchImageTests(unittest.IsolatedAsyncioTestCase):
         self.client._release_image_launch_gate = AsyncMock()
         self.client._get_recaptcha_token = AsyncMock(return_value=("recaptcha-token", "browser-1"))
         self.client._notify_browser_captcha_request_finished = AsyncMock()
+        self.client._notify_browser_captcha_error = AsyncMock()
 
     async def test_generate_images_batch_reuses_same_reference_inputs(self):
         captured = {}
@@ -159,9 +162,187 @@ class FlowClientBatchImageTests(unittest.IsolatedAsyncioTestCase):
             [{"name": "ref-1", "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}],
         )
 
+    async def test_generate_images_batch_retry_override_limits_attempts(self):
+        self.client._make_image_generation_request = AsyncMock(
+            side_effect=Exception("Flow API request failed: PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed")
+        )
+
+        with self.assertRaises(Exception):
+            await self.client.generate_images_batch(
+                at="at-token",
+                project_id="project-1",
+                prompts=["海报风", "摄影风"],
+                model_name="GEM_PIX",
+                aspect_ratio="IMAGE_ASPECT_RATIO_SQUARE",
+                token_id=1,
+                token_image_concurrency=2,
+                max_retries_override=1,
+            )
+
+        self.assertEqual(self.client._make_image_generation_request.await_count, 1)
+
 
 class GenerationHandlerMergedCaptchaTests(unittest.IsolatedAsyncioTestCase):
-    async def test_merged_batch_retries_missing_item_individually(self):
+    async def asyncSetUp(self):
+        self._original_flow_max_retries = config._config.setdefault("flow", {}).get("max_retries", 3)
+
+    async def asyncTearDown(self):
+        config._config.setdefault("flow", {})["max_retries"] = self._original_flow_max_retries
+
+    def _build_token(self):
+        return type(
+            "Token",
+            (),
+            {
+                "id": 1,
+                "at": "at-token",
+                "user_paygate_tier": "PAYGATE_TIER_PAID",
+                "image_concurrency": -1,
+            },
+        )()
+
+    def _build_handler(self, flow_client):
+        return GenerationHandler(
+            flow_client=flow_client,
+            token_manager=None,
+            load_balancer=None,
+            db=None,
+            concurrency_manager=None,
+            proxy_manager=None,
+        )
+
+    async def test_merged_batch_retries_all_failed_with_batch_attempt(self):
+        config._config.setdefault("flow", {})["max_retries"] = 2
+        token = self._build_token()
+        flow_client = type("FlowClientStub", (), {})()
+        flow_client.upload_image = AsyncMock()
+        flow_client.generate_images_batch = AsyncMock(
+            side_effect=[
+                Exception("Flow API request failed: PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed"),
+                (
+                    {
+                        "media": [
+                            {
+                                "name": "media-1",
+                                "image": {
+                                    "generatedImage": {
+                                        "fifeUrl": "https://example.com/1.png",
+                                    }
+                                },
+                            }
+                        ],
+                        "workflows": [
+                            {"metadata": {"displayName": "prompt-1", "primaryMediaId": "media-1"}},
+                        ],
+                    },
+                    "session-2",
+                    {"generation_attempts": [{"attempt": 1, "success": True}]},
+                ),
+            ]
+        )
+
+        handler = self._build_handler(flow_client)
+        perf_trace = {}
+
+        chunks = [
+            chunk
+            async for chunk in handler._handle_batch_image_generation(
+                token=token,
+                project_id="project-1",
+                model_config={
+                    "model_name": "GEM_PIX",
+                    "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
+                },
+                prompts=["prompt-1", "prompt-2"],
+                images=None,
+                stream=False,
+                merge_captcha=True,
+                perf_trace=perf_trace,
+                generation_result=handler._create_generation_result(),
+                response_state=handler._create_response_state(),
+                request_log_state=None,
+            )
+        ]
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(flow_client.generate_images_batch.await_count, 2)
+        for call_args in flow_client.generate_images_batch.await_args_list:
+            self.assertEqual(call_args.kwargs["max_retries_override"], 1)
+        payload = json.loads(chunks[0])
+        self.assertEqual(payload["batch_summary"]["succeeded"], 1)
+        self.assertEqual(payload["batch_summary"]["failed"], 1)
+        batch_attempts = perf_trace["image_generation"]["batch_attempts"]
+        self.assertEqual(len(batch_attempts), 2)
+        self.assertEqual(batch_attempts[0]["status"], "all_failed")
+        self.assertEqual(batch_attempts[1]["status"], "success")
+
+    async def test_merged_batch_retries_empty_success_result_with_batch_attempt(self):
+        config._config.setdefault("flow", {})["max_retries"] = 2
+        token = self._build_token()
+        flow_client = type("FlowClientStub", (), {})()
+        flow_client.upload_image = AsyncMock()
+        flow_client.generate_images_batch = AsyncMock(
+            side_effect=[
+                (
+                    {"media": [], "workflows": []},
+                    "session-1",
+                    {"generation_attempts": [{"attempt": 1, "success": True}]},
+                ),
+                (
+                    {
+                        "media": [
+                            {
+                                "name": "media-2",
+                                "image": {
+                                    "generatedImage": {
+                                        "fifeUrl": "https://example.com/2.png",
+                                    }
+                                },
+                            }
+                        ],
+                        "workflows": [
+                            {"metadata": {"displayName": "prompt-2", "primaryMediaId": "media-2"}},
+                        ],
+                    },
+                    "session-2",
+                    {"generation_attempts": [{"attempt": 1, "success": True}]},
+                ),
+            ]
+        )
+
+        handler = self._build_handler(flow_client)
+        perf_trace = {}
+
+        chunks = [
+            chunk
+            async for chunk in handler._handle_batch_image_generation(
+                token=token,
+                project_id="project-1",
+                model_config={
+                    "model_name": "GEM_PIX",
+                    "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
+                },
+                prompts=["prompt-1", "prompt-2"],
+                images=None,
+                stream=False,
+                merge_captcha=True,
+                perf_trace=perf_trace,
+                generation_result=handler._create_generation_result(),
+                response_state=handler._create_response_state(),
+                request_log_state=None,
+            )
+        ]
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(flow_client.generate_images_batch.await_count, 2)
+        payload = json.loads(chunks[0])
+        self.assertEqual(payload["batch_summary"]["succeeded"], 1)
+        batch_attempts = perf_trace["image_generation"]["batch_attempts"]
+        self.assertTrue(batch_attempts[0]["summary"]["all_failed"])
+        self.assertEqual(batch_attempts[1]["summary"]["succeeded"], 1)
+
+    async def test_merged_batch_partial_success_returns_without_individual_retry(self):
+        config._config.setdefault("flow", {})["max_retries"] = 3
         token = type(
             "Token",
             (),
@@ -196,14 +377,7 @@ class GenerationHandlerMergedCaptchaTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        handler = GenerationHandler(
-            flow_client=flow_client,
-            token_manager=None,
-            load_balancer=None,
-            db=None,
-            concurrency_manager=None,
-            proxy_manager=None,
-        )
+        handler = self._build_handler(flow_client)
         handler._process_single_batch_image_item = AsyncMock(
             return_value=(
                 {
@@ -252,10 +426,10 @@ class GenerationHandlerMergedCaptchaTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(chunks), 1)
         flow_client.generate_images_batch.assert_awaited_once()
-        handler._process_single_batch_image_item.assert_awaited_once()
-        retry_kwargs = handler._process_single_batch_image_item.await_args.kwargs
-        self.assertEqual(retry_kwargs["prompt_index"], 0)
-        self.assertEqual(retry_kwargs["prompt"], "prompt-1")
+        handler._process_single_batch_image_item.assert_not_awaited()
+        payload = json.loads(chunks[0])
+        self.assertEqual(payload["batch_summary"]["succeeded"], 1)
+        self.assertEqual(payload["batch_summary"]["failed"], 1)
 
 
 if __name__ == "__main__":
