@@ -2232,7 +2232,6 @@ class GenerationHandler:
                                 )
 
                     if not video_url:
-                        error_msg = "视频生成失败: 视频URL为空"
                         error_msg = "视频生成成功但未获取到媒体地址"
                         await self._fail_video_task(checked_operations, error_msg)
                         self._mark_generation_failed(generation_result, error_msg)

@@ -245,6 +245,7 @@ class FlowClient:
             host == candidate or host.endswith(f".{candidate}")
             for candidate in (
                 "google.com",
+                "googleapis.com",
                 "labs.google",
                 "recaptcha.net",
             )
@@ -440,6 +441,30 @@ class FlowClient:
             headers["sec-ch-ua-platform"] = inferred_fingerprint["sec_ch_ua_platform"]
         if not headers.get("sec-ch-ua-mobile") and inferred_fingerprint.get("sec_ch_ua_mobile"):
             headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
+
+        if isinstance(fingerprint, dict) and self._should_attach_runtime_session_cookies(url):
+            origin = str(fingerprint.get("origin") or "").strip() or "https://labs.google"
+            referer = str(fingerprint.get("referer") or "").strip()
+            if not referer:
+                fingerprint_project_id = str(fingerprint.get("project_id") or "").strip()
+                if fingerprint_project_id:
+                    referer = self._build_flow_project_page_url(fingerprint_project_id)
+            if origin:
+                headers.setdefault("Origin", origin)
+            if referer:
+                headers.setdefault("Referer", referer)
+            merged_cookie_header = self._merge_cookie_header(
+                headers.get("Cookie"),
+                fingerprint.get("session_cookies"),
+            )
+            if merged_cookie_header:
+                headers["Cookie"] = merged_cookie_header
+
+        if self._should_attach_runtime_session_cookies(url):
+            derived_project_id = self._extract_project_id_from_request_payload(json_data)
+            headers.setdefault("Origin", "https://labs.google")
+            if derived_project_id:
+                headers.setdefault("Referer", self._build_flow_project_page_url(derived_project_id))
 
         request_body_for_log = raw_body if raw_body is not None else json_data
         if config.debug_enabled:
@@ -2384,7 +2409,6 @@ class FlowClient:
                 "meta": {"values": ["undefined"]},
             })
             labs_get_paths = [
-                f"flow.projectInitialData?input={self._encode_trpc_input({'json': {'projectId': project_id}})}",
                 f"general.fetchUserPreferences?input={null_meta_input}",
                 f"videoFx.getFlowAppConfig?input={null_meta_input}",
                 f"videoFx.getUserSettings?input={null_meta_input}",
@@ -4658,21 +4682,36 @@ class FlowClient:
                 return None, None
         # API打码服务
         elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
-            # 为 API 打码也设置指纹（包含代理），确保 token 获取和后续请求环境一致
+            proxy_url = None
             if self.proxy_manager:
-                proxy_url = None
                 try:
                     proxy_url = await self.proxy_manager.get_request_proxy_url()
-                    if proxy_url:
-                        self._set_request_fingerprint({"proxy_url": proxy_url})
-                    else:
-                        self._set_request_fingerprint(None)
                 except Exception as e:
                     debug_logger.log_warning(f"[reCAPTCHA] Failed to get proxy for API captcha: {e}")
-                    self._set_request_fingerprint(None)
-            else:
-                self._set_request_fingerprint(None)
-            api_result = await self._get_api_captcha_token(captcha_method, project_id, action)
+
+            api_captcha_ua = self._generate_user_agent(str(token_id or project_id or captcha_method))
+            self._set_request_fingerprint(
+                self._build_fingerprint_from_user_agent(
+                    api_captcha_ua,
+                    accept_language=self._get_primary_accept_language(),
+                    proxy_url=proxy_url,
+                )
+            )
+            self._merge_request_fingerprint(
+                {
+                    "project_id": project_id,
+                    "origin": "https://labs.google",
+                    "referer": self._build_flow_project_page_url(project_id),
+                }
+            )
+
+            api_result = await self._get_api_captcha_token(
+                captcha_method,
+                project_id,
+                action,
+                proxy_url=proxy_url,
+                user_agent=api_captcha_ua,
+            )
             if api_result is None:
                 return None, None
             token, captcha_user_agent = api_result
@@ -4699,7 +4738,9 @@ class FlowClient:
         self,
         method: str,
         project_id: str,
-        action: str = "IMAGE_GENERATION"
+        action: str = "IMAGE_GENERATION",
+        proxy_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ) -> Optional[tuple[str, str]]:
         """通用API打码服务
 
@@ -4707,6 +4748,8 @@ class FlowClient:
             method: 打码服务类型
             project_id: 项目ID
             action: reCAPTCHA action类型 (IMAGE_GENERATION 或 VIDEO_GENERATION)
+            proxy_url: 预解析后的代理地址，确保打码与后续提交走同一出口
+            user_agent: 显式传给打码服务的 UA，避免 solve / submit 环境不一致
 
         Returns:
             (gRecaptchaResponse, userAgent) 元组, 或 None (失败时)。
@@ -4746,18 +4789,24 @@ class FlowClient:
             # 注意：curl_cffi 对 SOCKS5 使用 proxy 参数，HTTP 代理使用 proxies 参数
             proxy = None
             proxies = None
-            if self.proxy_manager:
+            resolved_proxy_url = str(proxy_url or "").strip()
+            if not resolved_proxy_url and self.proxy_manager:
                 try:
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                    if proxy_url:
-                        if proxy_url.startswith("socks5://"):
+                    resolved_proxy_url = str(await self.proxy_manager.get_request_proxy_url() or "").strip()
+                    if resolved_proxy_url:
+                        if resolved_proxy_url.startswith("socks5://"):
                             # curl_cffi 对 SOCKS5 使用 proxy 参数
-                            proxy = proxy_url
+                            proxy = resolved_proxy_url
                         else:
                             # HTTP/HTTPS 代理使用 proxies 字典
-                            proxies = {"http": proxy_url, "https": proxy_url}
+                            proxies = {"http": resolved_proxy_url, "https": resolved_proxy_url}
                 except Exception as e:
                     debug_logger.log_warning(f"[reCAPTCHA {method}] Failed to get proxy: {e}")
+            elif resolved_proxy_url:
+                if resolved_proxy_url.startswith("socks5://"):
+                    proxy = resolved_proxy_url
+                else:
+                    proxies = {"http": resolved_proxy_url, "https": resolved_proxy_url}
             
             async with AsyncSession() as session:
                 create_url = f"{base_url}/createTask"
@@ -4770,6 +4819,13 @@ class FlowClient:
                         "pageAction": page_action
                     }
                 }
+                effective_user_agent = str(
+                    user_agent
+                    or (self.get_request_fingerprint() or {}).get("user_agent")
+                    or self._generate_user_agent(str(project_id or method))
+                ).strip()
+                if effective_user_agent:
+                    create_data["task"]["userAgent"] = effective_user_agent
                 if min_score is not None:
                     create_data["task"]["minScore"] = min_score
 
@@ -4835,7 +4891,7 @@ class FlowClient:
                                 self._build_fingerprint_from_user_agent(
                                     solution.get("userAgent"),
                                     accept_language=self._get_primary_accept_language(),
-                                    proxy_url=proxy_url,
+                                    proxy_url=resolved_proxy_url,
                                 )
                             )
                             debug_logger.log_info(f"[reCAPTCHA {method}] Token获取成功")

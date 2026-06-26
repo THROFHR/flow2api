@@ -1,5 +1,6 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 from ..core.database import Database
@@ -22,6 +23,7 @@ class TokenManager:
         self._refresh_locks: dict[int, asyncio.Lock] = {}
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._refresh_futures: dict[int, asyncio.Task] = {}
+        self._at_validation_cache: dict[int, float] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
 
     async def _get_token_lock(
@@ -98,6 +100,19 @@ class TokenManager:
             normalized = proxy_manager.normalize_proxy_url(raw)
             return normalized or ""
         return raw
+
+    def _clear_at_validation_cache(self, token_id: int) -> None:
+        self._at_validation_cache.pop(int(token_id), None)
+
+    def _mark_at_valid(self, token_id: int, ttl_seconds: int = 300) -> None:
+        self._at_validation_cache[int(token_id)] = time.monotonic() + max(30, int(ttl_seconds or 300))
+
+    def _has_recent_at_validation(self, token_id: int) -> bool:
+        expires_at = float(self._at_validation_cache.get(int(token_id), 0.0) or 0.0)
+        if expires_at <= time.monotonic():
+            self._clear_at_validation_cache(token_id)
+            return False
+        return True
 
     async def _flow_call_for_token(self, token: Token, call):
         previous_fingerprint = self.flow_client.get_request_fingerprint()
@@ -399,6 +414,7 @@ class TokenManager:
         当用户编辑保存token时，如果token未过期，自动清空429禁用状态
         """
         update_fields = {}
+        credential_updated = any(value is not None for value in (st, at, at_expires))
 
         if st is not None:
             update_fields["st"] = st
@@ -441,6 +457,12 @@ class TokenManager:
 
         # 检查token是否因429被禁用，如果是且未过期，则清空429状态
         token = await self.db.get_token(token_id)
+        if credential_updated and token and not token.is_active:
+            debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 已更新凭证，自动恢复为启用状态")
+            update_fields["is_active"] = True
+            update_fields["ban_reason"] = None
+            update_fields["banned_at"] = None
+
         if token and token.ban_reason == "429_rate_limit":
             # 检查token是否过期
             is_expired = False
@@ -459,6 +481,8 @@ class TokenManager:
                 update_fields["banned_at"] = None
 
         if update_fields:
+            if credential_updated:
+                self._clear_at_validation_cache(token_id)
             await self.db.update_token(token_id, **update_fields)
 
     # ========== AT自动刷新逻辑 (核心) ==========
@@ -501,7 +525,21 @@ class TokenManager:
             return None
 
         if not self._should_refresh_at(token):
-            return token
+            if self._has_recent_at_validation(token.id):
+                return token
+            try:
+                credits_result = await self._get_credits_for_token(token, token.at)
+                await self.db.update_token(
+                    token.id,
+                    credits=credits_result.get("credits", 0),
+                    user_paygate_tier=credits_result.get("userPaygateTier"),
+                )
+                self._mark_at_valid(token.id)
+                return await self.db.get_token(token.id) or token
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[AT_CHECK] Token {token.id}: 本地判定未过期，但上游校验失败，准备刷新 AT/ST - {e}"
+                )
 
         if not await self._refresh_at(token.id):
             return None
@@ -550,6 +588,7 @@ class TokenManager:
 
             debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
             await self.disable_token(token_id)
+            self._clear_at_validation_cache(token_id)
             return False
 
     async def _refresh_at(self, token_id: int) -> bool:
@@ -623,6 +662,7 @@ class TokenManager:
                     credits=credits_result.get("credits", 0),
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
+                self._mark_at_valid(token_id)
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
                 record_token_refresh("at", "success")
                 return True
