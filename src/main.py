@@ -4,8 +4,8 @@ import os
 import sys
 import warnings
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -280,6 +280,15 @@ app.mount("/tmp", StaticFiles(directory=str(tmp_dir)), name="tmp")
 
 # HTML routes for frontend
 static_path = Path(__file__).parent.parent / "static"
+_STATIC_PAGE_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
+def _static_page_response(file_path: Path) -> FileResponse:
+    return FileResponse(str(file_path), headers=_STATIC_PAGE_NO_CACHE_HEADERS)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -287,7 +296,7 @@ async def index():
     """Redirect to login page"""
     login_file = static_path / "login.html"
     if login_file.exists():
-        return FileResponse(str(login_file))
+        return _static_page_response(login_file)
     return HTMLResponse(content="<h1>Flow2API</h1><p>Frontend not found</p>", status_code=404)
 
 
@@ -296,25 +305,31 @@ async def login_page():
     """Login page"""
     login_file = static_path / "login.html"
     if login_file.exists():
-        return FileResponse(str(login_file))
+        return _static_page_response(login_file)
     return HTMLResponse(content="<h1>Login Page Not Found</h1>", status_code=404)
 
 
 @app.get("/manage", response_class=HTMLResponse)
-async def manage_page():
+async def manage_page(request: Request):
     """Management console page"""
+    guard_response = _ensure_admin_page_session(request)
+    if guard_response is not None:
+        return guard_response
     manage_file = static_path / "manage.html"
     if manage_file.exists():
-        return FileResponse(str(manage_file))
+        return _static_page_response(manage_file)
     return HTMLResponse(content="<h1>Management Page Not Found</h1>", status_code=404)
 
 
 @app.get("/test", response_class=HTMLResponse)
-async def test_page():
+async def test_page(request: Request):
     """Model testing page"""
+    guard_response = _ensure_admin_page_session(request)
+    if guard_response is not None:
+        return guard_response
     test_file = static_path / "test.html"
     if test_file.exists():
-        return FileResponse(str(test_file))
+        return _static_page_response(test_file)
     return HTMLResponse(content="<h1>Test Page Not Found</h1>", status_code=404)
 
 
@@ -323,3 +338,8 @@ async def metrics():
     """Prometheus metrics endpoint for the main Flow2API service."""
     payload = await render_main_metrics(db, concurrency_manager=concurrency_manager)
     return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
+def _ensure_admin_page_session(request: Request):
+    token = admin.get_admin_token_from_cookie(request)
+    if not admin.is_admin_session_token_valid(token):
+        return RedirectResponse(url="/login", status_code=302)
+    return None

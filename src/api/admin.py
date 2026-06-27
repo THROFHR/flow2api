@@ -3,7 +3,7 @@ import asyncio
 import importlib
 import json
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -46,6 +46,7 @@ captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
+ADMIN_SESSION_COOKIE_NAME = "admin_session"
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
 
 
@@ -688,24 +689,40 @@ class TokenRefreshConfigRequest(BaseModel):
 
 # ========== Auth Middleware ==========
 
-async def verify_admin_token(authorization: str = Header(None)):
+async def verify_admin_token(request: Request, authorization: str = Header(None)):
     """Verify admin session token (NOT API key)"""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing authorization")
+    header_token = ""
+    if authorization and authorization.startswith("Bearer "):
+        header_token = authorization[7:].strip()
 
-    token = authorization[7:]
+    cookie_token = get_admin_token_from_cookie(request) or ""
 
-    # Check if token is in active session tokens
-    if token not in active_admin_tokens:
+    if header_token and header_token in active_admin_tokens:
+        return header_token
+
+    if cookie_token and cookie_token in active_admin_tokens:
+        return cookie_token
+
+    if header_token or cookie_token:
         raise HTTPException(status_code=401, detail="Invalid or expired admin token")
 
-    return token
+    raise HTTPException(status_code=401, detail="Missing authorization")
+
+
+def get_admin_token_from_cookie(request: Request) -> Optional[str]:
+    token = str(request.cookies.get(ADMIN_SESSION_COOKIE_NAME) or "").strip()
+    return token or None
+
+
+def is_admin_session_token_valid(token: Optional[str]) -> bool:
+    normalized = str(token or "").strip()
+    return bool(normalized) and normalized in active_admin_tokens
 
 
 # ========== Auth Endpoints ==========
 
 @router.post("/api/admin/login")
-async def admin_login(request: LoginRequest):
+async def admin_login(request: LoginRequest, response: Response):
     """Admin login - returns session token (NOT API key)"""
     admin_config = await db.get_admin_config()
 
@@ -718,6 +735,15 @@ async def admin_login(request: LoginRequest):
     # Store in active tokens
     active_admin_tokens.add(session_token)
 
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+    )
+
     return {
         "success": True,
         "token": session_token,  # Session token (NOT API key)
@@ -726,9 +752,10 @@ async def admin_login(request: LoginRequest):
 
 
 @router.post("/api/admin/logout")
-async def admin_logout(token: str = Depends(verify_admin_token)):
+async def admin_logout(response: Response, token: str = Depends(verify_admin_token)):
     """Admin logout - invalidate session token"""
     active_admin_tokens.discard(token)
+    response.delete_cookie(ADMIN_SESSION_COOKIE_NAME, path="/")
     return {"success": True, "message": "退出登录成功"}
 
 
@@ -1419,15 +1446,15 @@ async def get_system_info(token: str = Depends(verify_admin_token)):
 # ========== Additional Routes for Frontend Compatibility ==========
 
 @router.post("/api/login")
-async def login(request: LoginRequest):
+async def login(request: LoginRequest, response: Response):
     """Login endpoint (alias for /api/admin/login)"""
-    return await admin_login(request)
+    return await admin_login(request, response)
 
 
 @router.post("/api/logout")
-async def logout(token: str = Depends(verify_admin_token)):
+async def logout(response: Response, token: str = Depends(verify_admin_token)):
     """Logout endpoint (alias for /api/admin/logout)"""
-    return await admin_logout(token)
+    return await admin_logout(response, token)
 
 
 @router.get("/health")
