@@ -313,6 +313,8 @@ class ChatCompletionRequest(BaseModel):
     # Flow2API specific parameters
     image: Optional[str] = None  # Base64 encoded image (deprecated, use messages)
     video: Optional[str] = None  # Base64 encoded video (deprecated)
+    batch_prompts: Optional[List[str]] = None
+    batchPrompts: Optional[List[str]] = None
     # Gemini extension parameters (from extra_body or top-level)
     generationConfig: Optional[GenerationConfigParam] = None
     contents: Optional[List[Any]] = None  # Gemini native contents

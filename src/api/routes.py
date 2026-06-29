@@ -80,6 +80,7 @@ class NormalizedGenerationRequest:
     images: List[bytes]
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
+    batch_prompts: Optional[List[str]] = None
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -407,6 +408,32 @@ def _resolve_request_model(model: str, request: Any) -> str:
     return resolved_model
 
 
+def _get_openai_extra_body(request: ChatCompletionRequest) -> Dict[str, Any]:
+    extra = getattr(request, "model_extra", None)
+    if not isinstance(extra, dict):
+        return {}
+    extra_body = extra.get("extra_body") or extra.get("extraBody")
+    return extra_body if isinstance(extra_body, dict) else {}
+
+
+def _get_openai_batch_prompts(request: ChatCompletionRequest) -> Optional[List[str]]:
+    extra_body = _get_openai_extra_body(request)
+    raw_prompts = (
+        request.batch_prompts
+        or request.batchPrompts
+        or extra_body.get("batch_prompts")
+        or extra_body.get("batchPrompts")
+    )
+    if raw_prompts is None:
+        return None
+    if not isinstance(raw_prompts, list):
+        raise HTTPException(status_code=400, detail="batchPrompts must be a list of strings")
+
+    prompts = [str(item or "").strip() for item in raw_prompts]
+    prompts = [item for item in prompts if item]
+    return prompts or None
+
+
 def _get_request_base_url(request: Request) -> Optional[str]:
     """根据实际请求头推导对外可访问的基础地址。"""
     forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
@@ -423,6 +450,8 @@ def _get_request_base_url(request: Request) -> Optional[str]:
 async def _normalize_openai_request(
     request: ChatCompletionRequest,
 ) -> NormalizedGenerationRequest:
+    batch_prompts = _get_openai_batch_prompts(request)
+
     if request.messages:
         prompt, images, video_media_id = await _extract_prompt_and_images_from_openai_messages(
             request.messages
@@ -437,6 +466,7 @@ async def _normalize_openai_request(
             images=images,
             messages=request.messages,
             video_media_id=video_media_id,
+            batch_prompts=batch_prompts,
         )
 
     if request.contents:
@@ -446,6 +476,7 @@ async def _normalize_openai_request(
         )
         normalized = await _normalize_gemini_request(request.model, gemini_request)
         normalized.messages = request.messages
+        normalized.batch_prompts = batch_prompts
         return normalized
 
     raise HTTPException(status_code=400, detail="Messages or contents cannot be empty")
@@ -487,6 +518,7 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    batch_prompts: Optional[List[str]] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -497,6 +529,7 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        batch_prompts=batch_prompts,
     ):
         result = chunk
 
@@ -726,6 +759,7 @@ async def _iterate_openai_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        batch_prompts=normalized.batch_prompts,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -750,6 +784,7 @@ async def _iterate_gemini_stream(
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+        batch_prompts=normalized.batch_prompts,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -856,7 +891,7 @@ async def create_chat_completion(
     """OpenAI-compatible unified generation endpoint."""
     try:
         normalized = await _normalize_openai_request(request)
-        if not normalized.prompt:
+        if not normalized.prompt and not normalized.batch_prompts:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
@@ -879,6 +914,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                batch_prompts=normalized.batch_prompts,
             )
         )
         return _build_openai_json_response(payload)
@@ -900,7 +936,7 @@ async def generate_content(
     """Gemini official generateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
-        if not normalized.prompt:
+        if not normalized.prompt and not normalized.batch_prompts:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)
@@ -913,6 +949,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    batch_prompts=normalized.batch_prompts,
                 )
             )
         )
@@ -947,7 +984,7 @@ async def stream_generate_content(
     """Gemini official streamGenerateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
-        if not normalized.prompt:
+        if not normalized.prompt and not normalized.batch_prompts:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         request_base_url = _get_request_base_url(raw_request)

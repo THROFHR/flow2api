@@ -4,7 +4,7 @@ import base64
 import json
 import time
 from pathlib import Path
-from typing import Optional, AsyncGenerator, List, Dict, Any
+from typing import Optional, AsyncGenerator, List, Dict, Any, Tuple
 from ..core.logger import debug_logger
 from ..core.config import config
 from ..core.monitoring import record_generation_result
@@ -978,7 +978,13 @@ class GenerationHandler:
 
     def _create_generation_result(self) -> Dict[str, Any]:
         """????????????????"""
-        return dict(success=False, error_message=None, error_emitted=False)
+        return dict(
+            success=False,
+            error_message=None,
+            error_emitted=False,
+            usage_success=True,
+            result_status="success",
+        )
 
     def _create_response_state(self) -> Dict[str, Any]:
         """为单次请求创建独立的响应状态，避免并发请求互相污染。"""
@@ -994,13 +1000,24 @@ class GenerationHandler:
             generation_result["success"] = False
             generation_result["error_message"] = error_message
             generation_result["error_emitted"] = True
+            generation_result["usage_success"] = False
+            generation_result["result_status"] = "failed"
 
-    def _mark_generation_succeeded(self, generation_result: Optional[Dict[str, Any]]):
+    def _mark_generation_succeeded(
+        self,
+        generation_result: Optional[Dict[str, Any]],
+        *,
+        usage_success: bool = True,
+        result_status: str = "success",
+        message: Optional[str] = None,
+    ):
         """???????"""
         if isinstance(generation_result, dict):
             generation_result["success"] = True
-            generation_result["error_message"] = None
+            generation_result["error_message"] = message
             generation_result["error_emitted"] = False
+            generation_result["usage_success"] = usage_success
+            generation_result["result_status"] = result_status
 
     async def _resolve_video_asset(
         self,
@@ -1114,6 +1131,7 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        batch_prompts: Optional[List[str]] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1137,6 +1155,12 @@ class GenerationHandler:
         response_state = self._create_response_state()
         response_state["base_url"] = (base_url_override or "").strip().rstrip("/") or None
         request_log_state: Dict[str, Any] = {"id": None, "progress": 0}
+        normalized_batch_prompts: List[str] = []
+        for item in batch_prompts or []:
+            text = str(item or "").strip()
+            if text:
+                normalized_batch_prompts.append(text)
+        batch_prompts = normalized_batch_prompts or None
 
         # 防止并发链路复用到上一次请求的指纹上下文
         if hasattr(self.flow_client, "clear_request_fingerprint"):
@@ -1154,13 +1178,34 @@ class GenerationHandler:
         generation_type = model_config["type"]
         video_type_for_op = model_config.get("video_type", "")
         request_operation = "extend_video" if video_type_for_op == "extend" else f"generate_{generation_type}"
-        prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
+        prompt_log_source = prompt or (batch_prompts[0] if batch_prompts else "")
+        prompt_for_log = (
+            prompt_log_source
+            if len(prompt_log_source) <= 2000
+            else f"{prompt_log_source[:2000]}...(truncated)"
+        )
         request_payload = {
             "model": model,
             "prompt": prompt_for_log,
             "has_images": images is not None and len(images) > 0,
         }
-        debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
+        if batch_prompts:
+            request_payload["batch_prompt_count"] = len(batch_prompts)
+        debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt_log_source[:50]}...")
+
+        if batch_prompts and generation_type != "image":
+            error_msg = "batchPrompts 仅支持图片生成模型"
+            debug_logger.log_error(f"[GENERATION] {error_msg}")
+            record_generation_result(generation_type, "invalid", time.time() - start_time)
+            yield self._create_error_response(error_msg, status_code=400)
+            return
+
+        if batch_prompts and stream:
+            error_msg = "batchPrompts 暂不支持流式输出"
+            debug_logger.log_error(f"[GENERATION] {error_msg}")
+            record_generation_result(generation_type, "invalid", time.time() - start_time)
+            yield self._create_error_response(error_msg, status_code=400)
+            return
 
         # 向用户展示开始信息
         if stream:
@@ -1298,15 +1343,26 @@ class GenerationHandler:
             generation_pipeline_started_at = time.time()
             if generation_type == "image":
                 debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                async for chunk in self._handle_image_generation(
-                    token, project_id, model_config, prompt, images, stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state
-                ):
-                    yield chunk
+                if batch_prompts:
+                    async for chunk in self._handle_batch_image_generation(
+                        token, project_id, model_config, batch_prompts, images, stream,
+                        perf_trace=perf_trace,
+                        generation_result=generation_result,
+                        response_state=response_state,
+                        request_log_state=request_log_state,
+                        pending_token_state=pending_token_state,
+                    ):
+                        yield chunk
+                else:
+                    async for chunk in self._handle_image_generation(
+                        token, project_id, model_config, prompt, images, stream,
+                        perf_trace=perf_trace,
+                        generation_result=generation_result,
+                        response_state=response_state,
+                        request_log_state=request_log_state,
+                        pending_token_state=pending_token_state
+                    ):
+                        yield chunk
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
                 async for chunk in self._handle_video_generation(
@@ -1332,7 +1388,6 @@ class GenerationHandler:
                 perf_trace["status"] = "failed"
                 perf_trace["total_ms"] = int(duration * 1000)
                 perf_trace["error"] = error_msg
-                prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
                 await self._log_request(
                     token.id if token else None,
                     request_operation,
@@ -1350,25 +1405,30 @@ class GenerationHandler:
                     yield self._create_error_response(error_msg, status_code=500)
                 return
 
-            is_video = (generation_type == "video")
-            await self.token_manager.record_usage(token.id, is_video=is_video)
+            result_status = str(generation_result.get("result_status") or "success")
+            usage_success = bool(generation_result.get("usage_success", True))
 
-            # 重置错误计数 (请求成功时清空连续错误计数)
-            await self.token_manager.record_success(token.id)
+            if usage_success:
+                is_video = (generation_type == "video")
+                await self.token_manager.record_usage(token.id, is_video=is_video)
 
-            debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
+                # 重置错误计数 (请求成功时清空连续错误计数)
+                await self.token_manager.record_success(token.id)
+            else:
+                await self.token_manager.record_error(token.id)
+
+            debug_logger.log_info(f"[GENERATION] ✅ 生成响应完成 (status={result_status})")
 
             # 7. 记录成功日志
             duration = time.time() - start_time
-            record_generation_result(generation_type, "success", duration)
-            perf_trace["status"] = "success"
+            record_generation_result(generation_type, "success" if usage_success else "failed", duration)
+            perf_trace["status"] = result_status
             perf_trace["total_ms"] = int(duration * 1000)
             # 日志中保留更完整的 prompt，避免管理页只看到过短内容
-            prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
 
             # 构建响应数据，包含生成的URL
             response_data = {
-                "status": "success",
+                "status": result_status,
                 "model": model,
                 "prompt": prompt_for_log,
                 "performance": perf_trace
@@ -1413,7 +1473,6 @@ class GenerationHandler:
             perf_trace["status"] = "failed"
             perf_trace["total_ms"] = int(duration * 1000)
             perf_trace["error"] = error_msg
-            prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
             await self._log_request(
                 token.id if token else None,
                 request_operation if generation_type else "generate_unknown",
@@ -1443,7 +1502,6 @@ class GenerationHandler:
             perf_trace["status"] = "failed"
             perf_trace["total_ms"] = int(duration * 1000)
             perf_trace["error"] = error_msg
-            prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
             await self._log_request(
                 token.id if token else None,
                 request_operation if generation_type else "generate_unknown",
@@ -1507,6 +1565,444 @@ class GenerationHandler:
             return False
 
         return True
+
+    def _build_failed_batch_item(self, index: int, prompt: str, error_message: Any) -> Dict[str, Any]:
+        """构建批量图片失败项。"""
+        return {
+            "index": index,
+            "prompt": prompt,
+            "status": "failed",
+            "error": self._normalize_error_message(error_message, max_length=240),
+        }
+
+    def _build_batch_summary(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """汇总批量图片结果。"""
+        total = len(items)
+        succeeded = sum(1 for item in items if item.get("status") == "succeeded" and item.get("url"))
+        failed = max(0, total - succeeded)
+        return {
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "partial_success": bool(succeeded and failed),
+            "all_failed": bool(total and not succeeded),
+        }
+
+    def _get_first_successful_batch_url(self, items: List[Dict[str, Any]]) -> Optional[str]:
+        """返回批量结果中的第一张成功图片链接。"""
+        for item in items:
+            url = str(item.get("url") or "").strip()
+            if item.get("status") == "succeeded" and url:
+                return url
+        return None
+
+    def _extract_generated_image_media(self, media_entry: Dict[str, Any]) -> tuple[str, Optional[str]]:
+        """从上游 media 条目中提取图片 URL 和 mediaId。"""
+        image = media_entry.get("image", {}) if isinstance(media_entry, dict) else {}
+        generated_image = image.get("generatedImage", {}) if isinstance(image, dict) else {}
+        image_url = str(generated_image.get("fifeUrl") or "").strip()
+        if not image_url:
+            raise ValueError("生成结果缺少图片链接")
+        media_id = media_entry.get("name") if isinstance(media_entry, dict) else None
+        return image_url, media_id
+
+    def _align_batch_media_entries(
+        self,
+        media_entries: List[Dict[str, Any]],
+        workflow_entries: List[Dict[str, Any]],
+        prompts: List[str],
+    ) -> List[Optional[Dict[str, Any]]]:
+        """按 workflow.primaryMediaId 对齐批量图片结果，缺少信息时回退到数组顺序。"""
+        expected_count = len(prompts)
+        ordered_entries: List[Optional[Dict[str, Any]]] = [None] * expected_count
+        media_by_id = {
+            str(entry.get("name")): entry
+            for entry in media_entries
+            if isinstance(entry, dict) and entry.get("name")
+        }
+        prompt_indexes_by_text: Dict[str, List[int]] = {}
+        for idx, prompt in enumerate(prompts):
+            prompt_indexes_by_text.setdefault(str(prompt or "").strip(), []).append(idx)
+
+        mapped_count = 0
+        for workflow_index, workflow in enumerate(workflow_entries[:expected_count]):
+            if not isinstance(workflow, dict):
+                continue
+            metadata = workflow.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            media_id = str(metadata.get("primaryMediaId") or "").strip()
+            media_entry = media_by_id.get(media_id) if media_id else None
+            if not media_entry:
+                continue
+            display_name = str(metadata.get("displayName") or "").strip()
+            candidate_indexes = prompt_indexes_by_text.get(display_name) or []
+            target_index = None
+            while candidate_indexes:
+                candidate_index = candidate_indexes.pop(0)
+                if ordered_entries[candidate_index] is None:
+                    target_index = candidate_index
+                    break
+            if target_index is None and workflow_index < expected_count and ordered_entries[workflow_index] is None:
+                target_index = workflow_index
+            if target_index is not None:
+                ordered_entries[target_index] = media_entry
+                mapped_count += 1
+
+        if mapped_count:
+            return ordered_entries
+
+        for idx in range(expected_count):
+            if idx < len(media_entries) and isinstance(media_entries[idx], dict):
+                ordered_entries[idx] = media_entries[idx]
+        return ordered_entries
+
+    async def _build_merged_batch_success_item(
+        self,
+        *,
+        index: int,
+        prompt: str,
+        media_entry: Dict[str, Any],
+        response_state: Dict[str, Any],
+        upstream_trace: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """把合并批量接口返回的一条 media 结果转换成统一的 batch item。"""
+        item_trace: Dict[str, Any] = {
+            "index": index,
+            "prompt": prompt,
+            "status": "succeeded",
+        }
+        generated_asset: Dict[str, Any] = {
+            "type": "image",
+            "prompt": prompt,
+            "status": "succeeded",
+        }
+
+        image_url, media_id = self._extract_generated_image_media(media_entry)
+        final_url = image_url
+        cache_started_at = time.time()
+        if config.cache_enabled:
+            try:
+                cached_filename = await self.file_cache.download_and_cache(image_url, "image")
+                final_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+            except Exception as exc:
+                debug_logger.log_error(
+                    f"[BATCH IMAGE] Failed to cache merged image {index + 1}: {str(exc)}"
+                )
+                final_url = image_url
+
+        item_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
+        item_trace["origin_image_url"] = image_url
+        item_trace["media_id"] = media_id
+        item_trace["final_image_url"] = final_url
+        if upstream_trace is not None:
+            item_trace["upstream_trace"] = upstream_trace
+        generated_asset.update({
+            "origin_image_url": image_url,
+            "final_image_url": final_url,
+        })
+        return (
+            {
+                "index": index,
+                "prompt": prompt,
+                "status": "succeeded",
+                "url": final_url,
+                "origin_image_url": image_url,
+                "media_id": media_id,
+            },
+            generated_asset,
+            item_trace,
+        )
+
+    async def _handle_batch_image_generation(
+        self,
+        token,
+        project_id: str,
+        model_config: dict,
+        prompts: List[str],
+        images: Optional[List[bytes]],
+        stream: bool,
+        perf_trace: Optional[Dict[str, Any]] = None,
+        generation_result: Optional[Dict[str, Any]] = None,
+        response_state: Optional[Dict[str, Any]] = None,
+        request_log_state: Optional[Dict[str, Any]] = None,
+        pending_token_state: Optional[Dict[str, bool]] = None,
+    ) -> AsyncGenerator:
+        """处理批量图片生成，共享同一组参考图。"""
+        if response_state is None:
+            response_state = self._create_response_state()
+
+        image_trace: Optional[Dict[str, Any]] = None
+        if isinstance(perf_trace, dict):
+            image_trace = perf_trace.setdefault("image_generation", {})
+            image_trace["input_image_count"] = len(images) if images else 0
+            image_trace["batch_prompt_count"] = len(prompts)
+
+        if image_trace is not None:
+            image_trace["slot_wait_ms"] = 0
+
+        if images and len(images) > 0:
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text="uploading_images",
+                progress=28,
+            )
+        else:
+            await self._update_request_log_progress(
+                request_log_state,
+                token_id=token.id,
+                status_text="submitting_batch_images",
+                progress=28,
+            )
+
+        upload_started_at = time.time()
+        image_inputs = []
+        upload_error: Optional[str] = None
+        if images and len(images) > 0:
+            try:
+                for image_bytes in images:
+                    media_id = await self.flow_client.upload_image(
+                        token.at,
+                        image_bytes,
+                        model_config["aspect_ratio"],
+                        project_id=project_id,
+                    )
+                    image_inputs.append({
+                        "name": media_id,
+                        "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
+                    })
+            except Exception as exc:
+                upload_error = self._normalize_error_message(exc, max_length=240)
+        if image_trace is not None:
+            image_trace["upload_images_ms"] = int((time.time() - upload_started_at) * 1000)
+
+        batch_items: List[Dict[str, Any]] = []
+        batch_assets: List[Dict[str, Any]] = []
+        item_traces: List[Dict[str, Any]] = []
+
+        if upload_error:
+            batch_items = [
+                self._build_failed_batch_item(idx, prompt_text, upload_error)
+                for idx, prompt_text in enumerate(prompts)
+            ]
+            batch_assets = [
+                {
+                    "type": "image",
+                    "prompt": prompt_text,
+                    "status": "failed",
+                    "error": upload_error,
+                }
+                for prompt_text in prompts
+            ]
+            item_traces = [
+                {
+                    "index": idx,
+                    "prompt": prompt_text,
+                    "status": "failed",
+                    "error": upload_error,
+                }
+                for idx, prompt_text in enumerate(prompts)
+            ]
+        else:
+            batch_attempts: List[Dict[str, Any]] = []
+            total_generate_ms = 0
+            max_batch_attempts = max(1, config.flow_max_retries)
+            latest_upstream_trace: Optional[Dict[str, Any]] = None
+
+            for batch_attempt in range(max_batch_attempts):
+                attempt_started_at = time.time()
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text=f"submitting_batch_images_attempt_{batch_attempt + 1}",
+                    progress=28,
+                )
+                try:
+                    result, _generation_session_id, upstream_trace = await self.flow_client.generate_images_batch(
+                        at=token.at,
+                        project_id=project_id,
+                        prompts=prompts,
+                        model_name=model_config["model_name"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        image_inputs=image_inputs,
+                        token_id=token.id,
+                        token_image_concurrency=token.image_concurrency,
+                        max_retries_override=1,
+                    )
+                    latest_upstream_trace = upstream_trace
+
+                    media_entries = result.get("media", [])
+                    if isinstance(media_entries, dict):
+                        media_entries = [media_entries]
+                    workflow_entries = result.get("workflows", [])
+                    if not isinstance(media_entries, list):
+                        media_entries = []
+                    if not isinstance(workflow_entries, list):
+                        workflow_entries = []
+                    aligned_media_entries = self._align_batch_media_entries(
+                        media_entries,
+                        workflow_entries,
+                        prompts,
+                    )
+
+                    attempt_items: List[Dict[str, Any]] = []
+                    attempt_assets: List[Dict[str, Any]] = []
+                    attempt_traces: List[Dict[str, Any]] = []
+                    for idx, prompt_text in enumerate(prompts):
+                        item_trace: Dict[str, Any] = {
+                            "index": idx,
+                            "prompt": prompt_text,
+                            "status": "failed",
+                        }
+                        generated_asset: Dict[str, Any] = {
+                            "type": "image",
+                            "prompt": prompt_text,
+                            "status": "failed",
+                        }
+                        media_entry = aligned_media_entries[idx] if idx < len(aligned_media_entries) else None
+                        if not isinstance(media_entry, dict):
+                            error_message = "生成结果为空"
+                            item_trace["error"] = error_message
+                            generated_asset["error"] = error_message
+                            attempt_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
+                            attempt_assets.append(generated_asset)
+                            attempt_traces.append(item_trace)
+                            continue
+
+                        try:
+                            item_result, generated_asset, item_trace = await self._build_merged_batch_success_item(
+                                index=idx,
+                                prompt=prompt_text,
+                                media_entry=media_entry,
+                                response_state=response_state,
+                                upstream_trace=upstream_trace,
+                            )
+                        except Exception as exc:
+                            error_message = self._normalize_error_message(exc, max_length=240)
+                            item_trace["error"] = error_message
+                            generated_asset["error"] = error_message
+                            attempt_items.append(self._build_failed_batch_item(idx, prompt_text, error_message))
+                            attempt_assets.append(generated_asset)
+                            attempt_traces.append(item_trace)
+                            continue
+
+                        attempt_items.append(item_result)
+                        attempt_assets.append(generated_asset)
+                        attempt_traces.append(item_trace)
+
+                    attempt_summary = self._build_batch_summary(attempt_items)
+                    attempt_generate_ms = int((time.time() - attempt_started_at) * 1000)
+                    total_generate_ms += attempt_generate_ms
+                    batch_attempts.append({
+                        "attempt": batch_attempt + 1,
+                        "status": "success" if attempt_summary["succeeded"] else "all_failed",
+                        "summary": attempt_summary,
+                        "duration_ms": attempt_generate_ms,
+                        "upstream_trace": upstream_trace,
+                    })
+                    batch_items = attempt_items
+                    batch_assets = attempt_assets
+                    item_traces = attempt_traces
+
+                    if attempt_summary["succeeded"] > 0:
+                        break
+
+                    if batch_attempt < max_batch_attempts - 1:
+                        debug_logger.log_warning(
+                            f"[BATCH IMAGE] 合并批量第 {batch_attempt + 1}/{max_batch_attempts} 轮全部失败，准备重新整批提交"
+                        )
+                        await asyncio.sleep(1)
+                except Exception as exc:
+                    error_message = self._normalize_error_message(exc, max_length=240)
+                    attempt_generate_ms = int((time.time() - attempt_started_at) * 1000)
+                    total_generate_ms += attempt_generate_ms
+                    batch_items = [
+                        self._build_failed_batch_item(idx, prompt_text, error_message)
+                        for idx, prompt_text in enumerate(prompts)
+                    ]
+                    batch_assets = [
+                        {
+                            "type": "image",
+                            "prompt": prompt_text,
+                            "status": "failed",
+                            "error": error_message,
+                        }
+                        for prompt_text in prompts
+                    ]
+                    item_traces = [
+                        {
+                            "index": idx,
+                            "prompt": prompt_text,
+                            "status": "failed",
+                            "error": error_message,
+                        }
+                        for idx, prompt_text in enumerate(prompts)
+                    ]
+                    attempt_summary = self._build_batch_summary(batch_items)
+                    batch_attempts.append({
+                        "attempt": batch_attempt + 1,
+                        "status": "all_failed",
+                        "summary": attempt_summary,
+                        "duration_ms": attempt_generate_ms,
+                        "error": error_message,
+                    })
+                    if batch_attempt < max_batch_attempts - 1:
+                        debug_logger.log_warning(
+                            f"[BATCH IMAGE] 合并批量第 {batch_attempt + 1}/{max_batch_attempts} 轮异常且全部失败，准备重新整批提交: {error_message}"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+            if image_trace is not None:
+                image_trace["generate_api_ms"] = total_generate_ms
+                image_trace["batch_attempts"] = batch_attempts
+                if latest_upstream_trace is not None:
+                    image_trace["upstream_trace"] = latest_upstream_trace
+
+        await self._update_request_log_progress(
+            request_log_state,
+            token_id=token.id,
+            status_text="batch_images_generated",
+            progress=100,
+        )
+
+        summary = self._build_batch_summary(batch_items)
+        response_state["url"] = self._get_first_successful_batch_url(batch_items)
+        response_state["generated_assets"] = {
+            "type": "image_batch",
+            "items": batch_assets,
+            "summary": summary,
+        }
+        if image_trace is not None:
+            image_trace["batch_items"] = item_traces
+            image_trace["batch_summary"] = summary
+
+        if summary["succeeded"] > 0:
+            result_status = "partial_success" if summary["failed"] else "success"
+            summary_message = (
+                f"{summary['failed']} of {summary['total']} batch item(s) failed"
+                if summary["failed"]
+                else None
+            )
+            self._mark_generation_succeeded(
+                generation_result,
+                usage_success=True,
+                result_status=result_status,
+                message=summary_message,
+            )
+        else:
+            self._mark_generation_succeeded(
+                generation_result,
+                usage_success=False,
+                result_status="all_failed",
+                message="All batch items failed",
+            )
+
+        if stream:
+            yield self._create_stream_chunk("batchPrompts 暂不支持流式输出\n", finish_reason="stop")
+        else:
+            yield self._create_batch_image_completion_response(batch_items)
 
     async def _handle_image_generation(
         self,
@@ -2537,6 +3033,49 @@ class GenerationHandler:
 
         return json.dumps(response, ensure_ascii=False)
 
+    def _create_batch_image_completion_response(self, items: List[Dict[str, Any]]) -> str:
+        """创建批量图片的非流式响应。"""
+        import json
+        import time
+
+        content_blocks: List[str] = []
+        for idx, item in enumerate(items):
+            prompt = str(item.get("prompt") or "").strip()
+            prefix = f"[{idx + 1}]"
+            if prompt:
+                prefix = f"{prefix} {prompt}"
+
+            if item.get("status") == "succeeded" and item.get("url"):
+                content_blocks.append(f"{prefix}\n![Generated Image]({item['url']})")
+                continue
+
+            error_message = self._normalize_error_message(item.get("error"), max_length=240)
+            content_blocks.append(f"{prefix}\nGeneration failed: {error_message}")
+
+        summary = self._build_batch_summary(items)
+        response = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "flow2api",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "\n\n".join(content_blocks),
+                },
+                "finish_reason": "stop",
+            }],
+            "images": items,
+            "batch_summary": summary,
+        }
+
+        first_url = self._get_first_successful_batch_url(items)
+        if first_url:
+            response["url"] = first_url
+
+        return json.dumps(response, ensure_ascii=False)
+
     def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
         """创建错误响应"""
         import json
@@ -2587,7 +3126,8 @@ class GenerationHandler:
         if not log_id:
             return
 
-        safe_progress = max(0, min(100, int(progress)))
+        incoming_progress = max(0, min(100, int(progress)))
+        safe_progress = max(int(request_log_state.get("progress") or 0), incoming_progress)
         now = time.time()
         last_status_text = str(request_log_state.get("last_status_text") or "").strip()
         last_progress = int(request_log_state.get("last_progress") or 0)
