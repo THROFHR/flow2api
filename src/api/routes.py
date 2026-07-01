@@ -81,6 +81,8 @@ class NormalizedGenerationRequest:
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
     batch_prompts: Optional[List[str]] = None
+    merge_captcha: bool = False
+    debug_options: Optional[Dict[str, Any]] = None
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -487,13 +489,48 @@ async def _normalize_gemini_request(
     request: GeminiGenerateContentRequest,
 ) -> NormalizedGenerationRequest:
     resolved_model = _resolve_request_model(model, request)
+    debug_options = None
+    if isinstance(getattr(request, "model_extra", None), dict):
+        debug_options = request.model_extra.get("flowDebug")
+    if debug_options is None:
+        debug_options = getattr(request, "flowDebug", None)
+    merge_captcha = True
+    if isinstance(getattr(request, "model_extra", None), dict):
+        model_extra = request.model_extra
+        if "mergeCAPTCHA" in model_extra:
+            merge_captcha = bool(model_extra.get("mergeCAPTCHA"))
+    if getattr(request, "mergeCAPTCHA", None) is not None:
+        merge_captcha = bool(getattr(request, "mergeCAPTCHA"))
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
+    batch_prompts: Optional[List[str]] = None
+    if request.batchPrompts is not None:
+        batch_prompts = []
+        for idx, item in enumerate(request.batchPrompts):
+            if not isinstance(item, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"batchPrompts[{idx}] must be a string",
+                )
+            text = item.strip()
+            if text:
+                batch_prompts.append(text)
+        if not batch_prompts:
+            raise HTTPException(status_code=400, detail="batchPrompts cannot be empty")
+
     system_instruction = _extract_text_from_gemini_content(request.systemInstruction)
     model_config = MODEL_CONFIG.get(resolved_model)
     media_model = bool(model_config and model_config.get("type") in {"image", "video"})
 
     if media_model:
         prompt = _sanitize_media_prompt(prompt)
+        if batch_prompts:
+            batch_prompts = [_sanitize_media_prompt(item) for item in batch_prompts]
+
+    if batch_prompts:
+        batch_prompts = [
+            "\n\n".join(part for part in [prompt, item] if part).strip()
+            for item in batch_prompts
+        ]
 
     if system_instruction:
         if media_model and _should_ignore_media_system_instruction(system_instruction):
@@ -504,11 +541,19 @@ async def _normalize_gemini_request(
             if media_model:
                 system_instruction = _sanitize_media_prompt(system_instruction)
             prompt = f"{system_instruction}\n\n{prompt}".strip()
+            if batch_prompts:
+                batch_prompts = [
+                    f"{system_instruction}\n\n{item}".strip() if item else system_instruction
+                    for item in batch_prompts
+                ]
 
     return NormalizedGenerationRequest(
         model=resolved_model,
         prompt=prompt,
         images=images,
+        batch_prompts=batch_prompts,
+        merge_captcha=merge_captcha,
+        debug_options=debug_options,
     )
 
 
@@ -519,6 +564,8 @@ async def _collect_non_stream_result(
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
     batch_prompts: Optional[List[str]] = None,
+    merge_captcha: bool = False,
+    debug_options: Optional[Dict[str, Any]] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -530,6 +577,8 @@ async def _collect_non_stream_result(
         base_url_override=base_url_override,
         video_media_id=video_media_id,
         batch_prompts=batch_prompts,
+        merge_captcha=merge_captcha,
+        debug_options=debug_options,
     ):
         result = chunk
 
@@ -652,6 +701,24 @@ async def _build_image_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _build_image_reference_parts(uri: str) -> List[Dict[str, Any]]:
+    """Build lightweight Gemini image parts that preserve the original URL."""
+    if uri.startswith("data:image"):
+        mime_type, _ = _decode_data_url(uri)
+        match = DATA_URL_RE.match(uri)
+        if match:
+            return [{"inlineData": {"mimeType": mime_type, "data": match.group("data")}}]
+
+    return [
+        {
+            "fileData": {
+                "mimeType": _guess_mime_type(uri, "image/png"),
+                "fileUri": uri,
+            }
+        }
+    ]
+
+
 def _build_video_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
     return [
         {
@@ -688,6 +755,44 @@ async def _build_gemini_success_payload(
     payload: Dict[str, Any],
     response_model: str,
 ) -> Dict[str, Any]:
+    batch_images = payload.get("images")
+    if isinstance(batch_images, list) and batch_images:
+        candidates: List[Dict[str, Any]] = []
+        for idx, item in enumerate(batch_images):
+            if not isinstance(item, dict):
+                continue
+            image_url = str(item.get("url") or "").strip()
+            item_index = item.get("index", idx)
+            if isinstance(item_index, str) and item_index.isdigit():
+                item_index = int(item_index)
+            if not isinstance(item_index, int):
+                item_index = idx
+
+            if image_url:
+                parts = _build_image_reference_parts(image_url)
+            else:
+                prompt_text = str(item.get("prompt") or "").strip()
+                error_text = str(item.get("error") or "Generation failed").strip()
+                if prompt_text:
+                    parts = [{"text": f"[batch {item_index + 1}] {prompt_text}\nGeneration failed: {error_text}"}]
+                else:
+                    parts = [{"text": f"[batch {item_index + 1}] Generation failed: {error_text}"}]
+            candidates.append(
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": parts,
+                    },
+                    "finishReason": "STOP",
+                    "index": item_index,
+                }
+            )
+        if candidates:
+            return {
+                "candidates": candidates,
+                "modelVersion": response_model,
+            }
+
     output = _extract_openai_message_content(payload)
     return {
         "candidates": [
@@ -760,6 +865,8 @@ async def _iterate_openai_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         batch_prompts=normalized.batch_prompts,
+        merge_captcha=normalized.merge_captcha,
+        debug_options=normalized.debug_options,
     ):
         if chunk.startswith("data: "):
             yield chunk
@@ -785,6 +892,8 @@ async def _iterate_gemini_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
         batch_prompts=normalized.batch_prompts,
+        merge_captcha=normalized.merge_captcha,
+        debug_options=normalized.debug_options,
     ):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
@@ -915,6 +1024,8 @@ async def create_chat_completion(
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
                 batch_prompts=normalized.batch_prompts,
+                merge_captcha=normalized.merge_captcha,
+                debug_options=normalized.debug_options,
             )
         )
         return _build_openai_json_response(payload)
@@ -950,6 +1061,8 @@ async def generate_content(
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
                     batch_prompts=normalized.batch_prompts,
+                    merge_captcha=normalized.merge_captcha,
+                    debug_options=normalized.debug_options,
                 )
             )
         )
