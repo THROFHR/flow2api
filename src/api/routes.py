@@ -81,7 +81,7 @@ class NormalizedGenerationRequest:
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
     batch_prompts: Optional[List[str]] = None
-    merge_captcha: bool = False
+    merge_captcha: bool = True
     debug_options: Optional[Dict[str, Any]] = None
 
 
@@ -564,7 +564,7 @@ async def _collect_non_stream_result(
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
     batch_prompts: Optional[List[str]] = None,
-    merge_captcha: bool = False,
+    merge_captcha: bool = True,
     debug_options: Optional[Dict[str, Any]] = None,
 ) -> str:
     handler = _ensure_generation_handler()

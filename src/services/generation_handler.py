@@ -1132,6 +1132,8 @@ class GenerationHandler:
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
         batch_prompts: Optional[List[str]] = None,
+        merge_captcha: bool = True,
+        debug_options: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1191,6 +1193,7 @@ class GenerationHandler:
         }
         if batch_prompts:
             request_payload["batch_prompt_count"] = len(batch_prompts)
+            request_payload["merge_captcha"] = bool(merge_captcha)
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt_log_source[:50]}...")
 
         if batch_prompts and generation_type != "image":
@@ -1346,6 +1349,7 @@ class GenerationHandler:
                 if batch_prompts:
                     async for chunk in self._handle_batch_image_generation(
                         token, project_id, model_config, batch_prompts, images, stream,
+                        merge_captcha=merge_captcha,
                         perf_trace=perf_trace,
                         generation_result=generation_result,
                         response_state=response_state,
@@ -1722,6 +1726,7 @@ class GenerationHandler:
         prompts: List[str],
         images: Optional[List[bytes]],
         stream: bool,
+        merge_captcha: bool = True,
         perf_trace: Optional[Dict[str, Any]] = None,
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
